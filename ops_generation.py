@@ -5,7 +5,7 @@ import traceback
 from bpy.types import Context, Object, Operator
 
 from .dependency_manager import get_dependency_status
-from .retarget import apply_generated_motion, build_constraint_request
+from .retarget import apply_generated_motion, apply_static_source_motion, build_constraint_request
 from .runtime import run_generation_job
 from .preferences import get_preferences
 from .runtime_setup import get_runtime_setup_status
@@ -61,8 +61,13 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
         context.window.cursor_set("WAIT")
         try:
             request, source_data = build_constraint_request(context, armature_object, settings, source_frames)
-            output, response, worker_log = run_generation_job(context, request)
-            apply_generated_motion(context, armature_object, settings, source_data, output)
+            if request is None or not source_data.generation_required:
+                apply_static_source_motion(context, armature_object, settings, source_data)
+                response = {"device": "none"}
+                worker_log = ""
+            else:
+                output, response, worker_log = run_generation_job(context, request)
+                apply_generated_motion(context, armature_object, settings, source_data, output)
         except Exception as error:
             traceback.print_exc()
             self.report({"ERROR"}, str(error))
@@ -73,5 +78,9 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
         if worker_log:
             print(worker_log)
         device = response.get("device", "unknown")
-        self.report({"INFO"}, f"Generated {request['num_frames']} frames with {settings.model_name} on {device}.")
+        if request is None or not source_data.generation_required:
+            frame_count = source_frames[-1] - source_frames[0] + 1
+            self.report({"INFO"}, f"Applied a static hold across {frame_count} frames.")
+        else:
+            self.report({"INFO"}, f"Generated {request['num_frames']} frames with {settings.model_name} on {device}.")
         return {"FINISHED"}
