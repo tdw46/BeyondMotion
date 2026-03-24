@@ -1,0 +1,47 @@
+schema_version = "1.0.0"
+
+id = "beyond_motion"
+version = "0.1.0"
+name = "Beyond Motion"
+tagline = "Generate local humanoid inbetweens in Blender with Kimodo."
+maintainer = "BeyondDev (Tyler Walker)"
+type = "add-on"
+
+website = "https://beyond-3.gitbook.io/beyond-docs#overview"
+
+tags = ["Animation", "Rigging", "Sequencer"]
+
+blender_version_min = "5.0.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+copyright = [
+  "2026 Tyler Walker",
+]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".mypy_cache/",
+  "/.git/",
+  "/.github/",
+  ".gitignore",
+  ".gitattributes",
+  "*.pyc",
+  "*.pyo",
+  "*.pyd",
+  "*.zip",
+  "*.log",
+  "*.bat",
+  ".DS_Store",
+  "Thumbs.db",
+  ".vscode/",
+  ".idea/",
+  "*.egg-info/",
+  ".pytest_cache/",
+  ".tox/",
+  ".coverage",
+  "_vendor/",
+  "wheels/",
+  "*.sublime-*",
+]
