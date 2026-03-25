@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import bpy
 import numpy as np
@@ -974,14 +974,30 @@ def _keypose_match_factor(scene_frame: int, source_frame: int, window: int) -> f
     return (window + 1 - frame_delta) / float(window + 1)
 
 
-def _apply_keypose_match_pass(
+def _keypose_match_step_count(source_data: CapturedSourceData, window: int) -> int:
+    if window <= 0 or not source_data.constraint_frames:
+        return 0
+    frame_start = source_data.source_frames[0]
+    frame_end = source_data.source_frames[-1]
+    affected_frames = {
+        frame
+        for source_frame in source_data.constraint_frames
+        for frame in range(
+            max(frame_start, source_frame - window),
+            min(frame_end, source_frame + window) + 1,
+        )
+    }
+    return (len(affected_frames) * 2) + len(source_data.constraint_frames)
+
+
+def _iter_keypose_match_pass(
     context: Context,
     armature_object: Object,
     settings: BeyondMotionArmatureSettings,
     source_data: CapturedSourceData,
     assignment_map: dict[str, str],
     window: int,
-) -> None:
+) -> Iterator[dict[str, Any]]:
     if window <= 0 or not source_data.constraint_frames:
         return
 
@@ -1000,6 +1016,9 @@ def _apply_keypose_match_pass(
     )
     if not affected_frames:
         return
+    total_steps = _keypose_match_step_count(source_data, window)
+    if total_steps <= 0:
+        return
 
     # Animation Layers / multikey-style pass:
     # capture the generated result first, compute additive deltas from the original keyed poses,
@@ -1009,6 +1028,7 @@ def _apply_keypose_match_pass(
     rotation_deltas_by_source_frame: dict[int, dict[str, Matrix]] = {}
     root_deltas_by_source_frame: dict[int, Vector] = {}
     original_frame = context.scene.frame_current
+    completed_steps = 0
 
     try:
         for scene_frame in affected_frames:
@@ -1017,6 +1037,12 @@ def _apply_keypose_match_pass(
             rotations, root_location = _capture_local_pose_sample(armature_object, settings, assignment_map)
             base_rotations_by_frame[scene_frame] = rotations
             base_roots_by_frame[scene_frame] = root_location
+            completed_steps += 1
+            yield {
+                "progress": completed_steps / float(total_steps),
+                "status_text": "Applying keypose matching...",
+                "detail_text": f"Capturing base motion at frame {scene_frame}.",
+            }
 
         for source_frame in source_data.constraint_frames:
             base_rotations = base_rotations_by_frame.get(source_frame)
@@ -1035,6 +1061,12 @@ def _apply_keypose_match_pass(
                 )
             rotation_deltas_by_source_frame[source_frame] = delta_rotations
             root_deltas_by_source_frame[source_frame] = source_data.root_control_locations[source_frame] - base_root
+            completed_steps += 1
+            yield {
+                "progress": completed_steps / float(total_steps),
+                "status_text": "Applying keypose matching...",
+                "detail_text": f"Preparing additive correction for frame {source_frame}.",
+            }
 
         for scene_frame in affected_frames:
             base_rotations = base_rotations_by_frame.get(scene_frame, {})
@@ -1076,18 +1108,43 @@ def _apply_keypose_match_pass(
                     continue
                 _apply_rotation_to_pose_bone(pose_bone, rotation_matrix, scene_frame)
             _set_root_control_location(armature_object, settings, corrected_root, scene_frame)
+            completed_steps += 1
+            yield {
+                "progress": completed_steps / float(total_steps),
+                "status_text": "Applying keypose matching...",
+                "detail_text": f"Blending corrected keypose influence at frame {scene_frame}.",
+            }
     finally:
         context.scene.frame_set(original_frame)
         context.view_layer.update()
 
 
-def apply_generated_motion(
+def _apply_keypose_match_pass(
+    context: Context,
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    source_data: CapturedSourceData,
+    assignment_map: dict[str, str],
+    window: int,
+) -> None:
+    for _ in _iter_keypose_match_pass(
+        context,
+        armature_object,
+        settings,
+        source_data,
+        assignment_map,
+        window,
+    ):
+        pass
+
+
+def iter_apply_generated_motion(
     context: Context,
     armature_object: Object,
     settings: BeyondMotionArmatureSettings,
     source_data: CapturedSourceData,
     output: dict[str, np.ndarray],
-) -> None:
+) -> Iterator[dict[str, Any]]:
     settings.ensure_human_bones()
     assignment_map = settings.assignment_map()
     if not assignment_map:
@@ -1103,6 +1160,8 @@ def apply_generated_motion(
     override_source_frames_to_delete: set[int] = set()
     overridden_constraint_frames: dict[int, int] = {}
     sample_cache: dict[int, tuple[dict[str, Matrix], Vector, Vector, dict[str, Matrix]]] = {}
+    keypose_window = int(getattr(settings, "keypose_match_frames", 0) or 0)
+    keypose_steps = _keypose_match_step_count(source_data, keypose_window)
 
     def cached_generated_motion_sample(relative_index: int) -> tuple[dict[str, Matrix], Vector, Vector, dict[str, Matrix]]:
         cached = sample_cache.get(relative_index)
@@ -1151,6 +1210,13 @@ def apply_generated_motion(
         if abs(override_frame - constraint_frame) == 1:
             override_source_frames_to_delete.add(override_frame)
 
+    total_steps = local_rot_mats.shape[0]
+    if source_data.source_loop_matches:
+        total_steps += 1
+    total_steps += len(override_source_frames_to_delete)
+    total_steps += keypose_steps
+    total_steps = max(total_steps, 1)
+    completed_steps = 0
     original_frame = context.scene.frame_current
     try:
         for relative_index in range(local_rot_mats.shape[0]):
@@ -1214,6 +1280,12 @@ def apply_generated_motion(
                 generated_root,
                 target_pose_global_rotations,
             )
+            completed_steps += 1
+            yield {
+                "progress": completed_steps / float(total_steps),
+                "status_text": "Applying generated motion in Blender...",
+                "detail_text": f"Writing generated keys at frame {scene_frame}.",
+            }
 
         if source_data.source_loop_matches:
             first_frame = source_data.source_frames[0]
@@ -1242,19 +1314,57 @@ def apply_generated_motion(
                     if gap_frame <= first_frame:
                         continue
                     _delete_generated_frame_keys(armature_object, settings, assignment_map, gap_frame)
+                completed_steps += 1
+                yield {
+                    "progress": completed_steps / float(total_steps),
+                    "status_text": "Applying generated motion in Blender...",
+                    "detail_text": f"Preserving loop continuity at frame {last_frame}.",
+                }
 
         for frame in sorted(override_source_frames_to_delete):
             _delete_generated_frame_keys(armature_object, settings, assignment_map, frame)
+            completed_steps += 1
+            yield {
+                "progress": completed_steps / float(total_steps),
+                "status_text": "Cleaning adjacent override keys...",
+                "detail_text": f"Removing temporary override keys at frame {frame}.",
+            }
 
-        if int(getattr(settings, "keypose_match_frames", 0) or 0) > 0:
-            _apply_keypose_match_pass(
+        if keypose_window > 0:
+            keypose_base_step = completed_steps
+            for step in _iter_keypose_match_pass(
                 context,
                 armature_object,
                 settings,
                 source_data,
                 assignment_map,
-                int(settings.keypose_match_frames),
-            )
+                keypose_window,
+            ):
+                keypose_progress = float(step.get("progress", 0.0) or 0.0)
+                progress = (keypose_base_step + (keypose_progress * keypose_steps)) / float(total_steps)
+                yield {
+                    "progress": progress,
+                    "status_text": str(step.get("status_text", "Applying keypose matching...")),
+                    "detail_text": str(step.get("detail_text", "")),
+                }
+            completed_steps = keypose_base_step + keypose_steps
     finally:
         context.scene.frame_set(original_frame)
         context.view_layer.update()
+
+
+def apply_generated_motion(
+    context: Context,
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    source_data: CapturedSourceData,
+    output: dict[str, np.ndarray],
+) -> None:
+    for _ in iter_apply_generated_motion(
+        context,
+        armature_object,
+        settings,
+        source_data,
+        output,
+    ):
+        pass

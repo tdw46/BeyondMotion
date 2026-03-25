@@ -11,10 +11,18 @@ from .dependency_manager import (
 )
 from .human_bones import HumanBoneSpecification, HumanBoneSpecifications
 from .preferences import get_preferences
+from .runtime import get_generation_job_state
 from .runtime_setup import get_runtime_asset_job_state, get_runtime_setup_status
 from .utils import selected_keyframes_for_object, wrap_text_to_panel
 
 _PENDING_HUMAN_BONE_INITIALIZATIONS: set[str] = set()
+_UI_STATE_KEYS = {
+    "active": "_beyond_motion_generation_active",
+    "progress": "_beyond_motion_generation_progress",
+    "status_text": "_beyond_motion_generation_status_text",
+    "detail_text": "_beyond_motion_generation_detail_text",
+    "error_text": "_beyond_motion_generation_error_text",
+}
 
 
 def _active_armature_object(context: Context) -> Object | None:
@@ -39,6 +47,19 @@ def _tag_relevant_redraw() -> None:
         for area in screen.areas:
             if area.type in {"VIEW_3D", "DOPESHEET_EDITOR", "GRAPH_EDITOR"}:
                 area.tag_redraw()
+
+
+def _current_generation_ui_state(context: Context) -> dict[str, object]:
+    wm = getattr(context, "window_manager", None)
+    if wm is not None and any(key in wm for key in _UI_STATE_KEYS.values()):
+        return {
+            "active": bool(wm.get(_UI_STATE_KEYS["active"], False)),
+            "progress": float(wm.get(_UI_STATE_KEYS["progress"], 0.0) or 0.0),
+            "status_text": str(wm.get(_UI_STATE_KEYS["status_text"], "") or ""),
+            "detail_text": str(wm.get(_UI_STATE_KEYS["detail_text"], "") or ""),
+            "error_text": str(wm.get(_UI_STATE_KEYS["error_text"], "") or ""),
+        }
+    return get_generation_job_state()
 
 
 def _initialize_human_bones_later(armature_data_name: str):
@@ -266,13 +287,46 @@ def _draw_generation_settings(layout: UILayout, settings) -> None:
     settings_box.prop(settings, "keypose_match_frames")
 
 
-def _draw_generation_button(layout: UILayout, *, enabled: bool) -> None:
+def _draw_generation_progress(layout: UILayout, context: Context) -> bool:
+    state = _current_generation_ui_state(context)
+    active = bool(state.get("active", False))
+    status_text = str(state.get("status_text", "") or "")
+    error_text = str(state.get("error_text", "") or "")
+    if not active and not status_text and not error_text:
+        return False
+
+    progress_box = layout.box()
+    progress_box.alert = bool(error_text)
+    progress_box.label(
+        text="Generation Progress" if active else "Generation Status",
+        icon="TIME" if active else ("ERROR" if error_text else "CHECKMARK"),
+    )
+    if active and hasattr(progress_box, "progress"):
+        factor = max(0.0, min(1.0, float(state.get("progress", 0.0) or 0.0)))
+        progress_box.progress(factor=factor, text=f"{int(round(factor * 100.0))}%")
+    if status_text:
+        wrapped_status = wrap_text_to_panel(status_text, context, full_width=True, preferred_chars=42)
+        for index, line in enumerate(wrapped_status.splitlines() or [""]):
+            progress_box.label(text=line, icon=("INFO" if not error_text else "ERROR") if index == 0 else "BLANK1")
+    detail_text = str(state.get("detail_text", "") or "")
+    if detail_text and detail_text != status_text:
+        wrapped_detail = wrap_text_to_panel(detail_text, context, full_width=True, preferred_chars=42)
+        for line in (wrapped_detail.splitlines() or [""]):
+            progress_box.label(text=line)
+    return True
+
+
+def _draw_generation_button(layout: UILayout, *, enabled: bool, running: bool = False) -> None:
     button_row = layout.row()
-    button_row.alert = True
+    button_row.alert = not running
     button_row.scale_y = 1.6
-    button_row.enabled = enabled
+    button_row.enabled = enabled and not running
     button_row.operator_context = "EXEC_DEFAULT"
-    button_row.operator("beyond_motion.generate_inbetweens", text="Generate AI In-Betweens", icon="IPO_EASE_IN_OUT")
+    button_row.operator(
+        "beyond_motion.generate_inbetweens",
+        text="Generating AI In-Betweens..." if running else "Generate AI In-Betweens",
+        icon="TIME" if running else "IPO_EASE_IN_OUT",
+    )
 
 
 def _draw_missing_required_bones(layout: UILayout, settings) -> None:
@@ -600,27 +654,27 @@ class BEYONDMOTION_PT_main(Panel):
 
         runtime_header, runtime_body = layout.panel("beyond_motion_runtime", default_closed=True)
         runtime_header.label(text="Runtime", icon="PREFERENCES")
-        if not runtime_body:
-            return
-        if prefs is None:
-            runtime_body.label(text="Open add-on preferences to install generation dependencies.", icon="INFO")
-            return
-        runtime_body.label(text=f"Python: {prefs.resolved_python_executable()}")
-        runtime_body.label(text=f"Device: {prefs.torch_device}")
-        runtime_body.label(text=f"MPS Fallback: {'On' if prefs.enable_mps_fallback else 'Off'}")
-        runtime_body.label(text=f"Text Encoder Mode: {prefs.text_encoder_mode}")
-        runtime_body.label(text=f"Text Encoder: {prefs.text_encoder_url or 'auto'}")
-        runtime_body.label(text=f"Offline Only: {'On' if prefs.offline_only else 'Off'}")
-        if prefs.checkpoint_dir:
-            runtime_body.label(text=f"Checkpoints: {prefs.checkpoint_dir}")
-        runtime_body.label(
-            text=(
-                "Local text encoder service reachable"
-                if runtime_status.text_encoder_service_reachable
-                else "Using bundled local text encoder assets"
-            ),
-            icon="URL",
-        )
+        if runtime_body:
+            if prefs is None:
+                runtime_body.label(text="Open add-on preferences to install generation dependencies.", icon="INFO")
+            else:
+                runtime_body.label(text=f"Python: {prefs.resolved_python_executable()}")
+                runtime_body.label(text=f"Device: {prefs.torch_device}")
+                runtime_body.label(text=f"MPS Fallback: {'On' if prefs.enable_mps_fallback else 'Off'}")
+                runtime_body.label(text=f"Text Encoder Mode: {prefs.text_encoder_mode}")
+                runtime_body.label(text=f"Text Encoder: {prefs.text_encoder_url or 'auto'}")
+                runtime_body.label(text=f"Offline Only: {'On' if prefs.offline_only else 'Off'}")
+                if prefs.checkpoint_dir:
+                    runtime_body.label(text=f"Checkpoints: {prefs.checkpoint_dir}")
+                runtime_body.label(
+                    text=(
+                        "Local text encoder service reachable"
+                        if runtime_status.text_encoder_service_reachable
+                        else "Using bundled local text encoder assets"
+                    ),
+                    icon="URL",
+                )
+        _draw_generation_progress(layout, context)
 
 
 class BEYONDMOTION_PT_generate(Panel):
@@ -676,7 +730,6 @@ class BEYONDMOTION_PT_generate(Panel):
             )
             return
         selected_frames = _draw_generation_status(layout, context, armature_object, armature_data, settings)
-        layout.separator()
 
         prompt_box = layout.box()
         prompt_header = prompt_box.row()
@@ -695,7 +748,10 @@ class BEYONDMOTION_PT_generate(Panel):
         _draw_generation_button(
             layout,
             enabled=len(selected_frames) >= 2 and bool(settings.prompt.strip()),
+            running=bool(get_generation_job_state().get("active", False)),
         )
+        layout.separator()
+        _draw_generation_progress(layout, context)
 
 
 def _draw_timeline_header(self, context: Context) -> None:
