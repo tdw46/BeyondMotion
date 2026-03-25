@@ -262,6 +262,7 @@ def _draw_generation_settings(layout: UILayout, settings) -> None:
                 settings_box.prop(settings, "cfg_constraint_weight")
     settings_box.prop(settings, "seed")
     settings_box.prop(settings, "apply_postprocess")
+    settings_box.prop(settings, "hold_frame_bias")
     settings_box.prop(settings, "keypose_match_frames")
 
 

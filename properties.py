@@ -41,6 +41,12 @@ FORWARD_AXIS_ITEMS = (
     ("NEGATIVE_X", "-X Forward", "Character faces Blender -X", "AXIS_SIDE", 3),
 )
 
+HOLD_FRAME_BIAS_ITEMS = (
+    ("NONE", "None", "Keep duplicate keyed hold poses exactly as selected", "KEYFRAME", 0),
+    ("FIRST", "First Frame", "Delete the first frame in duplicate hold pairs so motion interpolates into the hold", "TRIA_RIGHT", 1),
+    ("LAST", "Last Frame", "Delete the last frame in duplicate hold pairs so motion interpolates out of the hold", "TRIA_LEFT", 2),
+)
+
 
 def update_generation_preview(self, context) -> None:
     del self
@@ -139,14 +145,23 @@ class BeyondMotionArmatureSettings(PropertyGroup):
             "This can smooth or correct some motion issues, but it may take longer and depends on the extra postprocess runtime being available."
         ),
     )
+    hold_frame_bias: EnumProperty(  # type: ignore[valid-type]
+        name="Hold Frame Bias",
+        items=HOLD_FRAME_BIAS_ITEMS,
+        default="NONE",
+        description=(
+            "Choose how duplicate source poses should be treated before generation. "
+            "First Frame deletes the first key in duplicate hold pairs, Last Frame deletes the last key, and None keeps both."
+        ),
+    )
     keypose_match_frames: IntProperty(  # type: ignore[valid-type]
         name="Keypose Match",
-        default=0,
+        default=4,
         min=0,
         max=12,
         description=(
-            "How many frames on each side of your keyed poses should blend back toward the original animation after generation. "
-            "Set this to 0 to keep the current adjacent-override behavior only. Higher values add an Animation Layers-style pose matching pass that hits your original key poses more exactly, while surrounding frames ease into and out of them."
+            "How many frames on each side of your kept keyed poses should blend back toward the original animation after generation. "
+            "Set this to 0 to skip the additive pose-match pass. Higher values add an Animation Layers-style correction that matches your original keyed poses more exactly, while surrounding frames ease into and out of them."
         ),
     )
     root_target_mode: EnumProperty(  # type: ignore[valid-type]

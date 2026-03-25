@@ -542,23 +542,42 @@ def _sequence_is_static_hold(
     )
 
 
-def _collapse_constraint_frames(
+def _apply_hold_frame_bias(
     source_frames: list[int],
     source_rotations: dict[int, dict[str, Matrix]],
     root_control_locations: dict[int, Vector],
+    bias_mode: str,
 ) -> list[int]:
-    if len(source_frames) <= 2:
+    if len(source_frames) <= 1 or bias_mode == "NONE":
         return source_frames.copy()
 
-    constraint_frames = [source_frames[0]]
-    for index in range(1, len(source_frames) - 1):
-        frame = source_frames[index]
-        next_frame = source_frames[index + 1]
-        if _frames_match_pose(frame, next_frame, source_rotations, root_control_locations):
-            continue
-        constraint_frames.append(frame)
-    constraint_frames.append(source_frames[-1])
-    return constraint_frames
+    filtered_frames: list[int] = []
+    run_start = 0
+    while run_start < len(source_frames):
+        run_end = run_start
+        while (
+            run_end + 1 < len(source_frames)
+            and _frames_match_pose(
+                source_frames[run_end],
+                source_frames[run_end + 1],
+                source_rotations,
+                root_control_locations,
+            )
+        ):
+            run_end += 1
+
+        run_frames = source_frames[run_start:run_end + 1]
+        if len(run_frames) == 1:
+            filtered_frames.extend(run_frames)
+        elif bias_mode == "FIRST":
+            filtered_frames.extend(run_frames[1:])
+        elif bias_mode == "LAST":
+            filtered_frames.extend(run_frames[:-1])
+        else:
+            filtered_frames.extend(run_frames)
+        run_start = run_end + 1
+
+    return filtered_frames or source_frames.copy()
 
 
 def _preferred_generated_override_frame(
@@ -687,7 +706,12 @@ def build_constraint_request(
 
     generation_required = not _sequence_is_static_hold(source_frames, source_rotations, root_control_locations)
     constraint_frames = (
-        _collapse_constraint_frames(source_frames, source_rotations, root_control_locations)
+        _apply_hold_frame_bias(
+            source_frames,
+            source_rotations,
+            root_control_locations,
+            str(getattr(settings, "hold_frame_bias", "NONE") or "NONE"),
+        )
         if generation_required
         else source_frames.copy()
     )
@@ -807,50 +831,6 @@ def _delete_generated_frame_keys(
     root_pose_bone = _get_pose_bone(armature_object, root_bone_name or "")
     if root_pose_bone is not None:
         root_pose_bone.keyframe_delete(data_path="location", frame=frame)
-
-
-def _relevant_motion_fcurves(
-    armature_object: Object,
-    settings: BeyondMotionArmatureSettings,
-    assignment_map: dict[str, str],
-):
-    animation_data = getattr(armature_object, "animation_data", None)
-    action = getattr(animation_data, "action", None) if animation_data else None
-    if action is None:
-        return []
-
-    mapped_bone_names = set(assignment_map.values())
-    root_bone_name = (
-        assignment_map.get("hips", "")
-        if settings.root_target_mode == "HIPS"
-        else settings.motion_root_bone
-    )
-    relevant = []
-    for fcurve in action.fcurves:
-        data_path = fcurve.data_path
-        if settings.root_target_mode == "OBJECT" and data_path == "location":
-            relevant.append(fcurve)
-            continue
-        if not data_path.startswith('pose.bones["'):
-            continue
-        bone_name = data_path.split('"')[1]
-        if bone_name in mapped_bone_names and data_path.endswith(
-            ("rotation_quaternion", "rotation_axis_angle", "rotation_euler")
-        ):
-            relevant.append(fcurve)
-            continue
-        if root_bone_name and bone_name == root_bone_name and data_path.endswith("location"):
-            relevant.append(fcurve)
-    return relevant
-
-
-def _set_constant_interpolation_on_frame(fcurve, frame: int) -> None:
-    for keyframe in fcurve.keyframe_points:
-        if abs(float(keyframe.co.x) - float(frame)) > 1.0e-4:
-            continue
-        keyframe.interpolation = "CONSTANT"
-        fcurve.update()
-        return
 
 
 def ensure_action(armature_object: Object) -> None:
@@ -1002,16 +982,16 @@ def _apply_keypose_match_pass(
     assignment_map: dict[str, str],
     window: int,
 ) -> None:
-    if window <= 0 or not source_data.source_frames:
+    if window <= 0 or not source_data.constraint_frames:
         return
 
     frame_start = source_data.source_frames[0]
     frame_end = source_data.source_frames[-1]
-    source_frame_set = set(source_data.source_frames)
+    source_frame_set = set(source_data.constraint_frames)
     affected_frames = sorted(
         {
             frame
-            for source_frame in source_data.source_frames
+            for source_frame in source_data.constraint_frames
             for frame in range(
                 max(frame_start, source_frame - window),
                 min(frame_end, source_frame + window) + 1,
@@ -1038,7 +1018,7 @@ def _apply_keypose_match_pass(
             base_rotations_by_frame[scene_frame] = rotations
             base_roots_by_frame[scene_frame] = root_location
 
-        for source_frame in source_data.source_frames:
+        for source_frame in source_data.constraint_frames:
             base_rotations = base_rotations_by_frame.get(source_frame)
             base_root = base_roots_by_frame.get(source_frame)
             if base_rotations is None or base_root is None:
@@ -1066,7 +1046,7 @@ def _apply_keypose_match_pass(
             else:
                 active_source_frames = [
                     (source_frame, _keypose_match_factor(scene_frame, source_frame, window))
-                    for source_frame in source_data.source_frames
+                    for source_frame in source_data.constraint_frames
                 ]
                 active_source_frames = [
                     (source_frame, factor)
@@ -1099,34 +1079,6 @@ def _apply_keypose_match_pass(
     finally:
         context.scene.frame_set(original_frame)
         context.view_layer.update()
-
-
-def _enforce_duplicate_pose_holds(
-    armature_object: Object,
-    settings: BeyondMotionArmatureSettings,
-    source_data: CapturedSourceData,
-    assignment_map: dict[str, str],
-) -> None:
-    hold_spans = [
-        (frame_a, frame_b)
-        for frame_a, frame_b in zip(source_data.source_frames, source_data.source_frames[1:])
-        if _frames_match_pose(
-            frame_a,
-            frame_b,
-            source_data.source_rotations,
-            source_data.root_control_locations,
-        )
-    ]
-    if not hold_spans:
-        return
-
-    for hold_start, hold_end in hold_spans:
-        for scene_frame in range(hold_start + 1, hold_end):
-            _delete_generated_frame_keys(armature_object, settings, assignment_map, scene_frame)
-
-    for fcurve in _relevant_motion_fcurves(armature_object, settings, assignment_map):
-        for hold_start, _hold_end in hold_spans:
-            _set_constant_interpolation_on_frame(fcurve, hold_start)
 
 
 def apply_generated_motion(
@@ -1302,12 +1254,6 @@ def apply_generated_motion(
                 source_data,
                 assignment_map,
                 int(settings.keypose_match_frames),
-            )
-            _enforce_duplicate_pose_holds(
-                armature_object,
-                settings,
-                source_data,
-                assignment_map,
             )
     finally:
         context.scene.frame_set(original_frame)
