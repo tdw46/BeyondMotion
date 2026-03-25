@@ -21,7 +21,14 @@ def selected_keyframes_for_object(obj) -> list[int]:
     return sorted(frames)
 
 
-def wrap_text_to_panel(text: str, context, *, min_chars: int = 8, full_width: bool = False) -> str:
+def wrap_text_to_panel(
+    text: str,
+    context,
+    *,
+    min_chars: int = 8,
+    full_width: bool = False,
+    preferred_chars: int | None = None,
+) -> str:
     """Wrap a string into multiple lines based on the current UI panel width.
 
     UI usage pattern:
@@ -29,20 +36,23 @@ def wrap_text_to_panel(text: str, context, *, min_chars: int = 8, full_width: bo
         for line in (wrapped.splitlines() or [""]):
             layout.label(text=line)
     """
-    try:
-        width = getattr(context.region, "width", 300) or 300
-        prefs = getattr(context, "preferences", None)
-        view = getattr(prefs, "view", None) if prefs else None
-        scale = getattr(view, "ui_scale", 1.0) if view else 1.0
+    if preferred_chars is not None:
+        max_chars = max(min_chars, int(preferred_chars))
+    else:
+        try:
+            width = getattr(context.region, "width", 300) or 300
+            prefs = getattr(context, "preferences", None)
+            view = getattr(prefs, "view", None) if prefs else None
+            scale = getattr(view, "ui_scale", 1.0) if view else 1.0
 
-        # Reserve pixels for icons/indents. full_width assumes a single-column layout.
-        reserved = 240 if not full_width else 110
-        available = max(50, width - reserved)
+            # Reserve pixels for icons/indents. full_width assumes a single-column layout.
+            reserved = 240 if not full_width else 110
+            available = max(50, width - reserved)
 
-        px_per_char = (13.5 if not full_width else 9.5) * max(scale, 0.5)
-        max_chars = max(min_chars, int(available / px_per_char) - 8)
-    except Exception:
-        max_chars = min_chars
+            px_per_char = (13.5 if not full_width else 9.5) * max(scale, 0.5)
+            max_chars = max(min_chars, int(available / px_per_char) - 8)
+        except Exception:
+            max_chars = min_chars
 
     # Cap to keep wrap reasonable even on very wide panels.
     max_cap = 75 if not full_width else 260

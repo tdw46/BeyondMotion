@@ -75,6 +75,11 @@ def _show_token_entry(runtime_status, hf_token: str) -> bool:
     return (not runtime_status.ready) and (_needs_guided_token_step(runtime_status) or bool((hf_token or "").strip()))
 
 
+def _generation_popover_available(context: Context) -> bool:
+    armature_object = _active_armature_object(context)
+    return armature_object is not None and isinstance(armature_object.data, Armature)
+
+
 def _draw_setup_box(
     layout: UILayout,
     context: Context,
@@ -190,6 +195,111 @@ def _draw_setup_box(
         actions.label(text="Setup complete", icon="CHECKMARK")
 
 
+def _draw_root_settings(layout: UILayout, settings, armature_data: Armature) -> None:
+    layout.prop(settings, "root_target_mode")
+    if settings.root_target_mode == "MOTION_ROOT":
+        layout.prop_search(settings, "motion_root_bone", armature_data, "bones", text="Motion Root")
+    layout.prop(settings, "blender_forward_axis")
+
+
+def _draw_tall_auto_assign_button(layout: UILayout) -> None:
+    button_row = layout.row()
+    button_row.scale_y = 1.3
+    button_row.operator(
+        "beyond_motion.auto_assign_human_bones",
+        text="Automatic Bone Assignment",
+        icon="ARMATURE_DATA",
+    )
+
+
+def _draw_generation_status(
+    layout: UILayout,
+    context: Context,
+    armature_object: Object,
+    armature_data: Armature,
+    settings,
+) -> list[int]:
+    generation_box = layout.box()
+    generation_box.label(text="Generation", icon="IPO_EASE_IN_OUT")
+    selected_frames = selected_keyframes_for_object(armature_object)
+    if selected_frames:
+        generation_box.label(
+            text=(
+                f"Selected Keyframes: {len(selected_frames)} "
+                f"({selected_frames[0]} to {selected_frames[-1]})"
+            ),
+            icon="ACTION",
+        )
+    else:
+        empty_row = generation_box.row()
+        empty_row.alert = True
+        empty_row.label(text="Select at least two keyframes to generate inbetweens.", icon="ERROR")
+    _draw_root_settings(generation_box, settings, armature_data)
+    return selected_frames
+
+
+def _draw_prompt_preview(layout: UILayout, context: Context, prompt: str) -> None:
+    preview_box = layout.box()
+    preview_box.label(text="Prompt Preview", icon="TEXT")
+    prompt_text = (prompt or "").strip()
+    if not prompt_text:
+        preview_box.label(text="Enter a movement prompt to preview it here.", icon="INFO")
+        return
+    wrapped = wrap_text_to_panel(prompt_text, context, full_width=True, preferred_chars=42)
+    for line in (wrapped.splitlines() or [""]):
+        preview_box.label(text=line)
+
+
+def _draw_generation_settings(layout: UILayout, settings) -> None:
+    settings_box = layout.box()
+    settings_box.label(text="Generation Settings", icon="SETTINGS")
+    settings_box.prop(settings, "model_name")
+    settings_box.prop(settings, "diffusion_steps")
+    settings_box.prop(settings, "cfg_type")
+    if settings.cfg_type != "nocfg":
+        settings_box.prop(settings, "cfg_text_weight")
+        if settings.cfg_type == "separated":
+            settings_box.prop(settings, "cfg_constraint_weight")
+    settings_box.prop(settings, "seed")
+    settings_box.prop(settings, "apply_postprocess")
+
+
+def _draw_generation_button(layout: UILayout, *, enabled: bool) -> None:
+    button_row = layout.row()
+    button_row.alert = True
+    button_row.scale_y = 1.6
+    button_row.enabled = enabled
+    button_row.operator_context = "EXEC_DEFAULT"
+    button_row.operator("beyond_motion.generate_inbetweens", text="Generate AI In-Betweens", icon="IPO_EASE_IN_OUT")
+
+
+def _draw_missing_required_bones(layout: UILayout, settings) -> None:
+    missing_required = settings.required_bones_missing()
+    if not missing_required:
+        return
+    warning_header, warning_body = layout.panel(
+        "beyond_motion_missing_required_bones",
+        default_closed=True,
+    )
+    warning_header.alert = True
+    warning_header.label(text="Missing Required Bones", icon="ERROR")
+    if warning_body:
+        warning_body.alert = True
+        warning_body.label(text="Required humanoid assignments still needed:")
+        missing_column = warning_body.column(align=True)
+        for title in missing_required:
+            missing_column.label(text=title)
+
+
+def _draw_keyframe_context_menu(self, context: Context) -> None:
+    layout = self.layout
+    layout.separator()
+    row = layout.row()
+    row.enabled = _generation_popover_available(context)
+    row.operator_context = "INVOKE_DEFAULT"
+    row.operator("beyond_motion.generate_inbetweens", text="AI Interpolation", icon="IPO_EASE_IN_OUT")
+
+
 def draw_human_bone_search(
     layout: UILayout,
     armature_data: Armature,
@@ -279,8 +389,6 @@ def draw_optional_bones_layout(armature: Object, layout: UILayout) -> None:
         return
     settings = armature_data.beyond_motion
     split_factor = 0.2
-
-    layout.label(text="Optional Human Bones", icon="BONE_DATA")
 
     row = layout.row(align=True).split(factor=split_factor, align=True)
     label_column = row.column(align=True)
@@ -464,82 +572,127 @@ class BEYONDMOTION_PT_main(Panel):
             )
             return
 
-        generation_box = layout.box()
-        generation_box.label(text="Generation", icon="IPO_EASE_IN_OUT")
-        generation_box.prop(settings, "prompt")
-        selected_frames = selected_keyframes_for_object(armature_object)
-        if selected_frames:
-            generation_box.label(
-                text=(
-                    f"Selected Keyframes: {len(selected_frames)} "
-                    f"({selected_frames[0]} to {selected_frames[-1]})"
-                ),
-                icon="ACTION",
-            )
-        else:
-            empty_row = generation_box.row()
-            empty_row.alert = True
-            empty_row.label(text="Select at least two keyframes to generate inbetweens.", icon="ERROR")
-        row = generation_box.row(align=True)
-        row.enabled = len(selected_frames) >= 2 and bool(settings.prompt.strip())
-        row.operator("beyond_motion.generate_inbetweens", text="Generate AI Inbetweens", icon="IPO_EASE_IN_OUT")
-        generation_box.prop(settings, "model_name")
-        generation_box.prop(settings, "diffusion_steps")
-        generation_box.prop(settings, "cfg_type")
-        if settings.cfg_type != "nocfg":
-            generation_box.prop(settings, "cfg_text_weight")
-            if settings.cfg_type == "separated":
-                generation_box.prop(settings, "cfg_constraint_weight")
-        generation_box.prop(settings, "seed")
-        generation_box.prop(settings, "apply_postprocess")
-        generation_box.prop(settings, "root_target_mode")
-        if settings.root_target_mode == "MOTION_ROOT":
-            generation_box.prop_search(settings, "motion_root_bone", armature_data, "bones", text="Motion Root")
-        generation_box.prop(settings, "blender_forward_axis")
-
-        missing_required = settings.required_bones_missing()
-        if missing_required:
-            warning_header, warning_body = generation_box.panel(
-                "beyond_motion_missing_required_bones",
-                default_closed=True,
-            )
-            warning_header.alert = True
-            warning_header.label(text="Missing Required Bones", icon="ERROR")
-            if warning_body:
-                warning_body.alert = True
-                warning_body.label(text="Required humanoid assignments still needed:")
-                missing_column = warning_body.column(align=True)
-                for title in missing_required:
-                    missing_column.label(text=title)
+        selected_frames = _draw_generation_status(layout, context, armature_object, armature_data, settings)
+        _draw_wrapped_lines(
+            layout.box(),
+            context,
+            "Click AI to enter the movement prompt and generation settings for the selected keyframes.",
+            icon="INFO",
+        )
+        _draw_missing_required_bones(layout, settings)
 
         humanoid_box = layout.box()
         humanoid_header = humanoid_box.row(align=True)
         humanoid_header.label(text="Humanoid", icon="OUTLINER_OB_ARMATURE")
-        humanoid_header.operator("beyond_motion.auto_assign_human_bones", text="Automatic Bone Assignment", icon="ARMATURE_DATA")
         humanoid_header.operator("beyond_motion.clear_human_bones", text="", icon="TRASH")
+        _draw_tall_auto_assign_button(humanoid_box)
         draw_required_bones_layout(armature_object, humanoid_box.box())
-        draw_optional_bones_layout(armature_object, humanoid_box.box())
+        optional_header, optional_body = humanoid_box.panel(
+            "beyond_motion_optional_human_bones",
+            default_closed=True,
+        )
+        optional_header.label(text="Optional Human Bones", icon="BONE_DATA")
+        if optional_body:
+            draw_optional_bones_layout(armature_object, optional_body.box())
+        _draw_tall_auto_assign_button(humanoid_box)
 
-        runtime_box = layout.box()
-        runtime_box.label(text="Runtime", icon="PREFERENCES")
-        if prefs is None:
-            runtime_box.label(text="Open add-on preferences to install generation dependencies.", icon="INFO")
+        runtime_header, runtime_body = layout.panel("beyond_motion_runtime", default_closed=True)
+        runtime_header.label(text="Runtime", icon="PREFERENCES")
+        if not runtime_body:
             return
-        runtime_box.label(text=f"Python: {prefs.resolved_python_executable()}")
-        runtime_box.label(text=f"Device: {prefs.torch_device}")
-        runtime_box.label(text=f"MPS Fallback: {'On' if prefs.enable_mps_fallback else 'Off'}")
-        runtime_box.label(text=f"Text Encoder Mode: {prefs.text_encoder_mode}")
-        runtime_box.label(text=f"Text Encoder: {prefs.text_encoder_url or 'auto'}")
-        runtime_box.label(text=f"Offline Only: {'On' if prefs.offline_only else 'Off'}")
+        if prefs is None:
+            runtime_body.label(text="Open add-on preferences to install generation dependencies.", icon="INFO")
+            return
+        runtime_body.label(text=f"Python: {prefs.resolved_python_executable()}")
+        runtime_body.label(text=f"Device: {prefs.torch_device}")
+        runtime_body.label(text=f"MPS Fallback: {'On' if prefs.enable_mps_fallback else 'Off'}")
+        runtime_body.label(text=f"Text Encoder Mode: {prefs.text_encoder_mode}")
+        runtime_body.label(text=f"Text Encoder: {prefs.text_encoder_url or 'auto'}")
+        runtime_body.label(text=f"Offline Only: {'On' if prefs.offline_only else 'Off'}")
         if prefs.checkpoint_dir:
-            runtime_box.label(text=f"Checkpoints: {prefs.checkpoint_dir}")
-        runtime_box.label(
+            runtime_body.label(text=f"Checkpoints: {prefs.checkpoint_dir}")
+        runtime_body.label(
             text=(
                 "Local text encoder service reachable"
                 if runtime_status.text_encoder_service_reachable
                 else "Using bundled local text encoder assets"
             ),
             icon="URL",
+        )
+
+
+class BEYONDMOTION_PT_generate(Panel):
+    bl_label = "AI Interpolation"
+    bl_idname = "BEYONDMOTION_PT_generate"
+    bl_space_type = "DOPESHEET_EDITOR"
+    bl_region_type = "HEADER"
+    bl_ui_units_x = 13
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return getattr(context.space_data, "mode", "") == "TIMELINE"
+
+    def draw(self, context: Context) -> None:
+        layout = self.layout
+        prefs = get_preferences(context)
+        armature_object = _active_armature_object(context)
+        if armature_object is None:
+            info_box = layout.box()
+            info_box.alert = True
+            info_box.label(text="Select an Armature", icon="ERROR")
+            _draw_wrapped_lines(
+                info_box,
+                context,
+                "Choose a humanoid FK armature first to enter a movement prompt and generate AI in-betweens.",
+                alert=True,
+                icon="ERROR",
+            )
+            return
+        armature_data = armature_object.data
+        if not isinstance(armature_data, Armature):
+            return
+        settings = armature_data.beyond_motion
+        dependency_status = get_dependency_status(prefs.torch_device if prefs else "auto")
+        runtime_status = get_runtime_setup_status(
+            model_name=settings.model_name,
+            text_encoder_mode=prefs.text_encoder_mode if prefs else "auto",
+            text_encoder_url=prefs.text_encoder_url if prefs else "",
+            checkpoint_dir_override=prefs.checkpoint_dir if prefs else "",
+            hf_token=prefs.hf_token if prefs else "",
+            offline_only=bool(prefs.offline_only) if prefs else False,
+        )
+        if not dependency_status.ready or not runtime_status.ready:
+            backend, download_estimate, disk_estimate = dependency_size_estimate(prefs.torch_device if prefs else "auto")
+            _draw_setup_box(
+                layout,
+                context,
+                dependency_status=dependency_status,
+                runtime_status=runtime_status,
+                backend=backend,
+                download_estimate=download_estimate,
+                disk_estimate=disk_estimate,
+            )
+            return
+        selected_frames = _draw_generation_status(layout, context, armature_object, armature_data, settings)
+        layout.separator()
+
+        prompt_box = layout.box()
+        prompt_header = prompt_box.row()
+        prompt_header.alert = True
+        prompt_header.label(text="Movement Prompt", icon="TEXT")
+        prompt_box.prop(settings, "prompt", text="")
+        _draw_prompt_preview(prompt_box, context, settings.prompt)
+
+        layout.separator()
+        _draw_generation_settings(layout, settings)
+
+        layout.separator()
+        _draw_missing_required_bones(layout, settings)
+
+        layout.separator()
+        _draw_generation_button(
+            layout,
+            enabled=len(selected_frames) >= 2 and bool(settings.prompt.strip()),
         )
 
 
@@ -553,32 +706,14 @@ def _draw_timeline_header(self, context: Context) -> None:
     layout.popover(panel="BEYONDMOTION_PT_main", text="Beyond", icon="ARMATURE_DATA")
 
     row = layout.row(align=True)
-    armature_object = _active_armature_object(context)
-    prefs = get_preferences(context)
-    is_enabled = False
-    if armature_object is not None and prefs is not None and isinstance(armature_object.data, Armature):
-        settings = armature_object.data.beyond_motion
-        dependency_status = get_dependency_status(prefs.torch_device)
-        runtime_status = get_runtime_setup_status(
-            model_name=settings.model_name,
-            text_encoder_mode=prefs.text_encoder_mode,
-            text_encoder_url=prefs.text_encoder_url,
-            checkpoint_dir_override=prefs.checkpoint_dir,
-            hf_token=prefs.hf_token,
-            offline_only=prefs.offline_only,
-        )
-        is_enabled = (
-            dependency_status.ready
-            and runtime_status.ready
-            and len(selected_keyframes_for_object(armature_object)) >= 2
-            and bool(settings.prompt.strip())
-        )
-    row.enabled = is_enabled
-    row.operator("beyond_motion.generate_inbetweens", text="AI", icon="IPO_EASE_IN_OUT")
+    row.enabled = _generation_popover_available(context)
+    row.popover(panel="BEYONDMOTION_PT_generate", text="AI", icon="IPO_EASE_IN_OUT")
 
 
 def register_header_draw() -> None:
     bpy.types.DOPESHEET_HT_header.append(_draw_timeline_header)
+    bpy.types.DOPESHEET_MT_context_menu.append(_draw_keyframe_context_menu)
+    bpy.types.GRAPH_MT_context_menu.append(_draw_keyframe_context_menu)
 
 
 def unregister_header_draw() -> None:
@@ -586,3 +721,11 @@ def unregister_header_draw() -> None:
         bpy.types.DOPESHEET_HT_header.remove(_draw_timeline_header)
     except Exception:
         pass
+    for menu in (
+        bpy.types.DOPESHEET_MT_context_menu,
+        bpy.types.GRAPH_MT_context_menu,
+    ):
+        try:
+            menu.remove(_draw_keyframe_context_menu)
+        except Exception:
+            pass
