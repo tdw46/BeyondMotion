@@ -297,6 +297,15 @@ def _blend_vectors(a: Vector, b: Vector, factor: float) -> Vector:
     return a + ((b - a) * factor)
 
 
+def _scaled_rotation_delta(delta: Matrix, factor: float) -> Matrix:
+    if factor <= 0.0:
+        return Matrix.Identity(3)
+    if factor >= 1.0:
+        return delta.copy()
+    identity = Quaternion((1.0, 0.0, 0.0, 0.0))
+    return _nlerp_quaternion(identity, delta.to_quaternion(), factor).to_matrix()
+
+
 def blender_position_to_kimodo(vector: Vector, forward_axis: str) -> list[float]:
     if forward_axis == "NEGATIVE_Y":
         return [vector.x, vector.z, -vector.y]
@@ -616,6 +625,20 @@ def _set_root_control_location(
     pose_bone.keyframe_insert(data_path="location", frame=frame)
 
 
+def _capture_local_pose_sample(
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    assignment_map: dict[str, str],
+) -> tuple[dict[str, Matrix], Vector]:
+    rotations: dict[str, Matrix] = {}
+    for human_bone_name, blender_bone_name in assignment_map.items():
+        pose_bone = _get_pose_bone(armature_object, blender_bone_name)
+        if pose_bone is None:
+            continue
+        rotations[human_bone_name] = _matrix_basis_rotation(pose_bone).copy()
+    return rotations, _capture_root_control_location(armature_object, settings).copy()
+
+
 def build_constraint_request(
     context: Context,
     armature_object: Object,
@@ -786,6 +809,50 @@ def _delete_generated_frame_keys(
         root_pose_bone.keyframe_delete(data_path="location", frame=frame)
 
 
+def _relevant_motion_fcurves(
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    assignment_map: dict[str, str],
+):
+    animation_data = getattr(armature_object, "animation_data", None)
+    action = getattr(animation_data, "action", None) if animation_data else None
+    if action is None:
+        return []
+
+    mapped_bone_names = set(assignment_map.values())
+    root_bone_name = (
+        assignment_map.get("hips", "")
+        if settings.root_target_mode == "HIPS"
+        else settings.motion_root_bone
+    )
+    relevant = []
+    for fcurve in action.fcurves:
+        data_path = fcurve.data_path
+        if settings.root_target_mode == "OBJECT" and data_path == "location":
+            relevant.append(fcurve)
+            continue
+        if not data_path.startswith('pose.bones["'):
+            continue
+        bone_name = data_path.split('"')[1]
+        if bone_name in mapped_bone_names and data_path.endswith(
+            ("rotation_quaternion", "rotation_axis_angle", "rotation_euler")
+        ):
+            relevant.append(fcurve)
+            continue
+        if root_bone_name and bone_name == root_bone_name and data_path.endswith("location"):
+            relevant.append(fcurve)
+    return relevant
+
+
+def _set_constant_interpolation_on_frame(fcurve, frame: int) -> None:
+    for keyframe in fcurve.keyframe_points:
+        if abs(float(keyframe.co.x) - float(frame)) > 1.0e-4:
+            continue
+        keyframe.interpolation = "CONSTANT"
+        fcurve.update()
+        return
+
+
 def ensure_action(armature_object: Object) -> None:
     armature_object.animation_data_create()
     if armature_object.animation_data and armature_object.animation_data.action is None:
@@ -918,6 +985,148 @@ def _override_smoothing_factor(scene_frame: int, overridden_keyframe: int, windo
     if frame_delta == 0 or frame_delta > window:
         return 0.0
     return (window + 1 - frame_delta) / float(window + 1)
+
+
+def _keypose_match_factor(scene_frame: int, source_frame: int, window: int) -> float:
+    frame_delta = abs(scene_frame - source_frame)
+    if frame_delta > window:
+        return 0.0
+    return (window + 1 - frame_delta) / float(window + 1)
+
+
+def _apply_keypose_match_pass(
+    context: Context,
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    source_data: CapturedSourceData,
+    assignment_map: dict[str, str],
+    window: int,
+) -> None:
+    if window <= 0 or not source_data.source_frames:
+        return
+
+    frame_start = source_data.source_frames[0]
+    frame_end = source_data.source_frames[-1]
+    source_frame_set = set(source_data.source_frames)
+    affected_frames = sorted(
+        {
+            frame
+            for source_frame in source_data.source_frames
+            for frame in range(
+                max(frame_start, source_frame - window),
+                min(frame_end, source_frame + window) + 1,
+            )
+        }
+    )
+    if not affected_frames:
+        return
+
+    # Animation Layers / multikey-style pass:
+    # capture the generated result first, compute additive deltas from the original keyed poses,
+    # then feather those deltas across neighboring frames before baking them back into one action.
+    base_rotations_by_frame: dict[int, dict[str, Matrix]] = {}
+    base_roots_by_frame: dict[int, Vector] = {}
+    rotation_deltas_by_source_frame: dict[int, dict[str, Matrix]] = {}
+    root_deltas_by_source_frame: dict[int, Vector] = {}
+    original_frame = context.scene.frame_current
+
+    try:
+        for scene_frame in affected_frames:
+            context.scene.frame_set(scene_frame)
+            context.view_layer.update()
+            rotations, root_location = _capture_local_pose_sample(armature_object, settings, assignment_map)
+            base_rotations_by_frame[scene_frame] = rotations
+            base_roots_by_frame[scene_frame] = root_location
+
+        for source_frame in source_data.source_frames:
+            base_rotations = base_rotations_by_frame.get(source_frame)
+            base_root = base_roots_by_frame.get(source_frame)
+            if base_rotations is None or base_root is None:
+                continue
+
+            source_rotations = source_data.source_rotations.get(source_frame, {})
+            delta_rotations: dict[str, Matrix] = {}
+            for human_bone_name, base_rotation in base_rotations.items():
+                source_rotation = source_rotations.get(human_bone_name)
+                if source_rotation is None:
+                    continue
+                delta_rotations[human_bone_name] = _orthonormalize_rotation(
+                    base_rotation.inverted_safe() @ source_rotation
+                )
+            rotation_deltas_by_source_frame[source_frame] = delta_rotations
+            root_deltas_by_source_frame[source_frame] = source_data.root_control_locations[source_frame] - base_root
+
+        for scene_frame in affected_frames:
+            base_rotations = base_rotations_by_frame.get(scene_frame, {})
+            corrected_rotations = {name: matrix.copy() for name, matrix in base_rotations.items()}
+            corrected_root = base_roots_by_frame.get(scene_frame, Vector((0.0, 0.0, 0.0))).copy()
+
+            if scene_frame in source_frame_set:
+                active_source_frames = [(scene_frame, 1.0)]
+            else:
+                active_source_frames = [
+                    (source_frame, _keypose_match_factor(scene_frame, source_frame, window))
+                    for source_frame in source_data.source_frames
+                ]
+                active_source_frames = [
+                    (source_frame, factor)
+                    for source_frame, factor in active_source_frames
+                    if factor > 0.0
+                ]
+
+            if not active_source_frames:
+                continue
+
+            for source_frame, factor in active_source_frames:
+                for human_bone_name, delta_rotation in rotation_deltas_by_source_frame.get(source_frame, {}).items():
+                    current_rotation = corrected_rotations.get(human_bone_name)
+                    if current_rotation is None:
+                        continue
+                    corrected_rotations[human_bone_name] = _orthonormalize_rotation(
+                        current_rotation @ _scaled_rotation_delta(delta_rotation, factor)
+                    )
+                corrected_root += root_deltas_by_source_frame.get(source_frame, Vector((0.0, 0.0, 0.0))) * factor
+
+            context.scene.frame_set(scene_frame)
+            context.view_layer.update()
+            for human_bone_name, blender_bone_name in assignment_map.items():
+                pose_bone = _get_pose_bone(armature_object, blender_bone_name)
+                rotation_matrix = corrected_rotations.get(human_bone_name)
+                if pose_bone is None or rotation_matrix is None:
+                    continue
+                _apply_rotation_to_pose_bone(pose_bone, rotation_matrix, scene_frame)
+            _set_root_control_location(armature_object, settings, corrected_root, scene_frame)
+    finally:
+        context.scene.frame_set(original_frame)
+        context.view_layer.update()
+
+
+def _enforce_duplicate_pose_holds(
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    source_data: CapturedSourceData,
+    assignment_map: dict[str, str],
+) -> None:
+    hold_spans = [
+        (frame_a, frame_b)
+        for frame_a, frame_b in zip(source_data.source_frames, source_data.source_frames[1:])
+        if _frames_match_pose(
+            frame_a,
+            frame_b,
+            source_data.source_rotations,
+            source_data.root_control_locations,
+        )
+    ]
+    if not hold_spans:
+        return
+
+    for hold_start, hold_end in hold_spans:
+        for scene_frame in range(hold_start + 1, hold_end):
+            _delete_generated_frame_keys(armature_object, settings, assignment_map, scene_frame)
+
+    for fcurve in _relevant_motion_fcurves(armature_object, settings, assignment_map):
+        for hold_start, _hold_end in hold_spans:
+            _set_constant_interpolation_on_frame(fcurve, hold_start)
 
 
 def apply_generated_motion(
@@ -1084,6 +1293,22 @@ def apply_generated_motion(
 
         for frame in sorted(override_source_frames_to_delete):
             _delete_generated_frame_keys(armature_object, settings, assignment_map, frame)
+
+        if int(getattr(settings, "keypose_match_frames", 0) or 0) > 0:
+            _apply_keypose_match_pass(
+                context,
+                armature_object,
+                settings,
+                source_data,
+                assignment_map,
+                int(settings.keypose_match_frames),
+            )
+            _enforce_duplicate_pose_holds(
+                armature_object,
+                settings,
+                source_data,
+                assignment_map,
+            )
     finally:
         context.scene.frame_set(original_frame)
         context.view_layer.update()

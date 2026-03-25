@@ -259,9 +259,10 @@ def _draw_generation_settings(layout: UILayout, settings) -> None:
     if settings.cfg_type != "nocfg":
         settings_box.prop(settings, "cfg_text_weight")
         if settings.cfg_type == "separated":
-            settings_box.prop(settings, "cfg_constraint_weight")
+                settings_box.prop(settings, "cfg_constraint_weight")
     settings_box.prop(settings, "seed")
     settings_box.prop(settings, "apply_postprocess")
+    settings_box.prop(settings, "keypose_match_frames")
 
 
 def _draw_generation_button(layout: UILayout, *, enabled: bool) -> None:

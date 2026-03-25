@@ -139,6 +139,16 @@ class BeyondMotionArmatureSettings(PropertyGroup):
             "This can smooth or correct some motion issues, but it may take longer and depends on the extra postprocess runtime being available."
         ),
     )
+    keypose_match_frames: IntProperty(  # type: ignore[valid-type]
+        name="Keypose Match",
+        default=0,
+        min=0,
+        max=12,
+        description=(
+            "How many frames on each side of your keyed poses should blend back toward the original animation after generation. "
+            "Set this to 0 to keep the current adjacent-override behavior only. Higher values add an Animation Layers-style pose matching pass that hits your original key poses more exactly, while surrounding frames ease into and out of them."
+        ),
+    )
     root_target_mode: EnumProperty(  # type: ignore[valid-type]
         name="Root Target",
         items=ROOT_TARGET_ITEMS,
