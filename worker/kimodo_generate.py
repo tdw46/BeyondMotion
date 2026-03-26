@@ -88,13 +88,27 @@ def main() -> int:
             value = value.detach().cpu().numpy()
         return np.asarray(value)
 
+    local_rot_mats = as_numpy(output["local_rot_mats"])
+    root_positions = as_numpy(output["root_positions"])
+    global_rot_mats = as_numpy(output["global_rot_mats"])
+    if int(local_rot_mats.shape[1]) == 30:
+        from kimodo.skeleton import SOMASkeleton30
+
+        local_rot_tensor = torch.as_tensor(local_rot_mats, dtype=torch.float32)
+        root_positions_tensor = torch.as_tensor(root_positions, dtype=torch.float32)
+        soma30 = SOMASkeleton30()
+        local_rot_77 = soma30.to_SOMASkeleton77(local_rot_tensor)
+        global_rot_77, _, _ = soma30.somaskel77.fk(local_rot_77, root_positions_tensor)
+        local_rot_mats = local_rot_77.detach().cpu().numpy()
+        global_rot_mats = global_rot_77.detach().cpu().numpy()
+
     response_path = Path(args.response)
     output_npz = response_path.with_name("output_motion.npz")
-    np.savez_compressed(
+    np.savez(
         output_npz,
-        local_rot_mats=as_numpy(output["local_rot_mats"]),
-        root_positions=as_numpy(output["root_positions"]),
-        global_rot_mats=as_numpy(output["global_rot_mats"]),
+        local_rot_mats=local_rot_mats,
+        root_positions=root_positions,
+        global_rot_mats=global_rot_mats,
         posed_joints=as_numpy(output["posed_joints"]),
         foot_contacts=as_numpy(output["foot_contacts"]),
         smooth_root_pos=as_numpy(output["smooth_root_pos"]),
@@ -107,7 +121,7 @@ def main() -> int:
                 "device": device,
                 "requested_device": requested_device,
                 "fps": float(model.fps),
-                "num_frames": int(as_numpy(output["root_positions"]).shape[0]),
+                "num_frames": int(root_positions.shape[0]),
             },
             indent=2,
         ),

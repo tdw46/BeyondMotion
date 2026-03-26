@@ -8,7 +8,7 @@ from typing import Any, Iterator
 import bpy
 import numpy as np
 from bpy.types import Context, Object, PoseBone
-from mathutils import Matrix, Quaternion, Vector
+from mathutils import Euler, Matrix, Quaternion, Vector
 
 from .human_bones import HumanBoneSpecifications
 from .properties import BeyondMotionArmatureSettings
@@ -334,6 +334,104 @@ def _scaled_rotation_delta(delta: Matrix, factor: float) -> Matrix:
         return delta.copy()
     identity = Quaternion((1.0, 0.0, 0.0, 0.0))
     return _nlerp_quaternion(identity, delta.to_quaternion(), factor).to_matrix()
+
+
+def _align_quaternion_sign(quaternion: Quaternion, reference: Quaternion | None) -> Quaternion:
+    aligned = quaternion.copy()
+    if reference is not None and aligned.dot(reference) < 0.0:
+        aligned.negate()
+    return aligned
+
+
+def _capture_rotation_channel_values(pose_bone: PoseBone) -> tuple[str, list[float]]:
+    if pose_bone.rotation_mode == "QUATERNION":
+        return "rotation_quaternion", [
+            float(pose_bone.rotation_quaternion.w),
+            float(pose_bone.rotation_quaternion.x),
+            float(pose_bone.rotation_quaternion.y),
+            float(pose_bone.rotation_quaternion.z),
+        ]
+    if pose_bone.rotation_mode == "AXIS_ANGLE":
+        return "rotation_axis_angle", [
+            float(pose_bone.rotation_axis_angle[0]),
+            float(pose_bone.rotation_axis_angle[1]),
+            float(pose_bone.rotation_axis_angle[2]),
+            float(pose_bone.rotation_axis_angle[3]),
+        ]
+    return "rotation_euler", [
+        float(pose_bone.rotation_euler.x),
+        float(pose_bone.rotation_euler.y),
+        float(pose_bone.rotation_euler.z),
+    ]
+
+
+def _desired_rotation_channel_values(
+    pose_bone: PoseBone,
+    local_rotation: Matrix,
+    reference_values: list[float] | None = None,
+) -> tuple[str, list[float]]:
+    reference_quaternion: Quaternion | None = None
+    if reference_values is not None:
+        if pose_bone.rotation_mode == "QUATERNION" and len(reference_values) == 4:
+            reference_quaternion = Quaternion(reference_values)
+        elif pose_bone.rotation_mode == "AXIS_ANGLE" and len(reference_values) == 4:
+            reference_quaternion = Quaternion(
+                Vector((
+                    float(reference_values[1]),
+                    float(reference_values[2]),
+                    float(reference_values[3]),
+                )),
+                float(reference_values[0]),
+            )
+        elif pose_bone.rotation_mode not in {"QUATERNION", "AXIS_ANGLE"} and len(reference_values) == 3:
+            reference_quaternion = Euler(reference_values, pose_bone.rotation_mode).to_quaternion()
+
+    desired_quaternion = _align_quaternion_sign(local_rotation.to_quaternion(), reference_quaternion)
+    if pose_bone.rotation_mode == "QUATERNION":
+        return "rotation_quaternion", [
+            float(desired_quaternion.w),
+            float(desired_quaternion.x),
+            float(desired_quaternion.y),
+            float(desired_quaternion.z),
+        ]
+    if pose_bone.rotation_mode == "AXIS_ANGLE":
+        axis, angle = desired_quaternion.to_axis_angle()
+        return "rotation_axis_angle", [
+            float(angle),
+            float(axis.x),
+            float(axis.y),
+            float(axis.z),
+        ]
+
+    reference_euler = None
+    if reference_values is not None and len(reference_values) == 3:
+        reference_euler = Euler(reference_values, pose_bone.rotation_mode)
+    desired_euler = desired_quaternion.to_euler(pose_bone.rotation_mode, reference_euler)
+    return "rotation_euler", [
+        float(desired_euler.x),
+        float(desired_euler.y),
+        float(desired_euler.z),
+    ]
+
+
+def _apply_rotation_channel_values(
+    pose_bone: PoseBone,
+    channel_path: str,
+    values: list[float],
+    frame: int,
+) -> None:
+    if channel_path == "rotation_quaternion" and len(values) == 4:
+        quaternion = Quaternion(values)
+        quaternion.normalize()
+        pose_bone.rotation_quaternion = quaternion
+        pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+        return
+    if channel_path == "rotation_axis_angle" and len(values) == 4:
+        pose_bone.rotation_axis_angle = values
+        pose_bone.keyframe_insert(data_path="rotation_axis_angle", frame=frame)
+        return
+    pose_bone.rotation_euler = Euler(values, pose_bone.rotation_mode)
+    pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame)
 
 
 def blender_position_to_kimodo(vector: Vector, forward_axis: str) -> list[float]:
@@ -1492,6 +1590,10 @@ def _apply_location_to_pose_bone(pose_bone: PoseBone, location: Vector, frame: i
     pose_bone.keyframe_insert(data_path="location", frame=frame)
 
 
+def _writeback_needs_pose_evaluation(settings: BeyondMotionArmatureSettings) -> bool:
+    return settings.root_target_mode in {"HIPS", "MOTION_ROOT"}
+
+
 def _delete_rotation_keyframes(pose_bone: PoseBone, frame: int) -> None:
     pose_bone.keyframe_delete(data_path="rotation_quaternion", frame=frame)
     pose_bone.keyframe_delete(data_path="rotation_axis_angle", frame=frame)
@@ -1549,8 +1651,9 @@ def apply_static_source_motion(
     original_frame = context.scene.frame_current
     try:
         for scene_frame in range(source_data.source_frames[0], source_data.source_frames[-1] + 1):
-            context.scene.frame_set(scene_frame)
-            context.view_layer.update()
+            if _writeback_needs_pose_evaluation(settings):
+                context.scene.frame_set(scene_frame)
+                context.view_layer.update()
             for human_bone_name, blender_bone_name in assignment_map.items():
                 pose_bone = _get_pose_bone(armature_object, blender_bone_name)
                 rotation_matrix = rotations.get(human_bone_name)
@@ -1768,9 +1871,9 @@ def _iter_keypose_match_pass(
     # Animation Layers / multikey-style pass:
     # capture the generated result first, compute additive deltas from the original keyed poses,
     # then feather those deltas across neighboring frames before baking them back into one action.
-    base_rotations_by_frame: dict[int, dict[str, Matrix]] = {}
+    base_rotation_channels_by_frame: dict[int, dict[str, tuple[str, list[float]]]] = {}
     base_roots_by_frame: dict[int, Vector] = {}
-    rotation_deltas_by_source_frame: dict[int, dict[str, Matrix]] = {}
+    rotation_channel_deltas_by_source_frame: dict[int, dict[str, tuple[str, list[float]]]] = {}
     root_deltas_by_source_frame: dict[int, Vector] = {}
     original_frame = context.scene.frame_current
     completed_steps = 0
@@ -1779,8 +1882,15 @@ def _iter_keypose_match_pass(
         for scene_frame in affected_frames:
             context.scene.frame_set(scene_frame)
             context.view_layer.update()
-            rotations, root_location = _capture_local_pose_sample(armature_object, settings, assignment_map)
-            base_rotations_by_frame[scene_frame] = rotations
+            frame_rotation_channels: dict[str, tuple[str, list[float]]] = {}
+            for human_bone_name, blender_bone_name in assignment_map.items():
+                pose_bone = _get_pose_bone(armature_object, blender_bone_name)
+                if pose_bone is None:
+                    continue
+                channel_path, values = _capture_rotation_channel_values(pose_bone)
+                frame_rotation_channels[human_bone_name] = (channel_path, values)
+            base_rotation_channels_by_frame[scene_frame] = frame_rotation_channels
+            _, root_location = _capture_local_pose_sample(armature_object, settings, assignment_map)
             base_roots_by_frame[scene_frame] = root_location
             completed_steps += 1
             yield {
@@ -1790,21 +1900,35 @@ def _iter_keypose_match_pass(
             }
 
         for source_frame in source_data.constraint_frames:
-            base_rotations = base_rotations_by_frame.get(source_frame)
+            base_rotation_channels = base_rotation_channels_by_frame.get(source_frame)
             base_root = base_roots_by_frame.get(source_frame)
-            if base_rotations is None or base_root is None:
+            if base_rotation_channels is None or base_root is None:
                 continue
 
             source_rotations = source_data.source_rotations.get(source_frame, {})
-            delta_rotations: dict[str, Matrix] = {}
-            for human_bone_name, base_rotation in base_rotations.items():
+            delta_rotations: dict[str, tuple[str, list[float]]] = {}
+            for human_bone_name, (channel_path, base_values) in base_rotation_channels.items():
                 source_rotation = source_rotations.get(human_bone_name)
                 if source_rotation is None:
                     continue
-                delta_rotations[human_bone_name] = _orthonormalize_rotation(
-                    base_rotation.inverted_safe() @ source_rotation
+                pose_bone = _get_pose_bone(armature_object, assignment_map.get(human_bone_name, ""))
+                if pose_bone is None:
+                    continue
+                desired_channel_path, desired_values = _desired_rotation_channel_values(
+                    pose_bone,
+                    source_rotation,
+                    reference_values=base_values,
                 )
-            rotation_deltas_by_source_frame[source_frame] = delta_rotations
+                if desired_channel_path != channel_path or len(desired_values) != len(base_values):
+                    continue
+                delta_rotations[human_bone_name] = (
+                    channel_path,
+                    [
+                        float(desired_value - base_value)
+                        for desired_value, base_value in zip(desired_values, base_values)
+                    ],
+                )
+            rotation_channel_deltas_by_source_frame[source_frame] = delta_rotations
             root_deltas_by_source_frame[source_frame] = source_data.root_control_locations[source_frame] - base_root
             completed_steps += 1
             yield {
@@ -1814,8 +1938,11 @@ def _iter_keypose_match_pass(
             }
 
         for scene_frame in affected_frames:
-            base_rotations = base_rotations_by_frame.get(scene_frame, {})
-            corrected_rotations = {name: matrix.copy() for name, matrix in base_rotations.items()}
+            base_rotation_channels = base_rotation_channels_by_frame.get(scene_frame, {})
+            corrected_rotations = {
+                name: (channel_path, list(values))
+                for name, (channel_path, values) in base_rotation_channels.items()
+            }
             corrected_root = base_roots_by_frame.get(scene_frame, Vector((0.0, 0.0, 0.0))).copy()
 
             active_source_frames = _keypose_match_source_influences(
@@ -1834,12 +1961,19 @@ def _iter_keypose_match_pass(
                 continue
 
             for source_frame, factor in active_source_frames:
-                for human_bone_name, delta_rotation in rotation_deltas_by_source_frame.get(source_frame, {}).items():
+                for human_bone_name, (delta_channel_path, delta_values) in rotation_channel_deltas_by_source_frame.get(source_frame, {}).items():
                     current_rotation = corrected_rotations.get(human_bone_name)
                     if current_rotation is None:
                         continue
-                    corrected_rotations[human_bone_name] = _orthonormalize_rotation(
-                        current_rotation @ _scaled_rotation_delta(delta_rotation, factor)
+                    current_channel_path, current_values = current_rotation
+                    if current_channel_path != delta_channel_path or len(current_values) != len(delta_values):
+                        continue
+                    corrected_rotations[human_bone_name] = (
+                        current_channel_path,
+                        [
+                            float(current_value + (delta_value * factor))
+                            for current_value, delta_value in zip(current_values, delta_values)
+                        ],
                     )
                 corrected_root += root_deltas_by_source_frame.get(source_frame, Vector((0.0, 0.0, 0.0))) * factor
 
@@ -1847,10 +1981,11 @@ def _iter_keypose_match_pass(
             context.view_layer.update()
             for human_bone_name, blender_bone_name in assignment_map.items():
                 pose_bone = _get_pose_bone(armature_object, blender_bone_name)
-                rotation_matrix = corrected_rotations.get(human_bone_name)
-                if pose_bone is None or rotation_matrix is None:
+                rotation_data = corrected_rotations.get(human_bone_name)
+                if pose_bone is None or rotation_data is None:
                     continue
-                _apply_rotation_to_pose_bone(pose_bone, rotation_matrix, scene_frame)
+                channel_path, values = rotation_data
+                _apply_rotation_channel_values(pose_bone, channel_path, values, scene_frame)
             _set_root_control_location(armature_object, settings, corrected_root, scene_frame)
             completed_steps += 1
             yield {
@@ -1968,10 +2103,11 @@ def iter_apply_generated_motion(
     try:
         for relative_index in range(local_rot_mats.shape[0]):
             scene_frame = frame_start + relative_index
-            context.scene.frame_set(scene_frame)
-            context.view_layer.update()
+            if _writeback_needs_pose_evaluation(settings):
+                context.scene.frame_set(scene_frame)
+                context.view_layer.update()
 
-            if scene_frame in source_frame_set:
+            if scene_frame in source_frame_set and use_adjacent_override_pass:
                 override_relative_index = overridden_constraint_frames.get(scene_frame)
                 if override_relative_index is None:
                     rotations = source_data.source_rotations[scene_frame]
@@ -1982,7 +2118,6 @@ def iter_apply_generated_motion(
                     rotations, root_location, generated_root, target_pose_global_rotations = cached_generated_motion_sample(
                         override_relative_index,
                     )
-                hips_location_applied = False
             else:
                 rotations, root_location, generated_root, target_pose_global_rotations = cached_generated_motion_sample(
                     relative_index,
@@ -2046,8 +2181,9 @@ def iter_apply_generated_motion(
                     loop_generated_root,
                     loop_target_pose_global_rotations,
                 ) = cached_generated_motion_sample(first_override_relative_index)
-                context.scene.frame_set(last_frame)
-                context.view_layer.update()
+                if _writeback_needs_pose_evaluation(settings):
+                    context.scene.frame_set(last_frame)
+                    context.view_layer.update()
                 _apply_sampled_frame(
                     armature_object,
                     settings,

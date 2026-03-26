@@ -211,6 +211,11 @@ class BeyondMotionArmatureSettings(PropertyGroup):
             "This helps locomotion stay grounded and directional, but you can turn it off if a rig behaves better without that extra path guidance."
         ),
     )
+    show_generation_settings: BoolProperty(  # type: ignore[valid-type]
+        name="Show Generation Settings",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
     root_target_mode: EnumProperty(  # type: ignore[valid-type]
         name="Root Target",
         items=ROOT_TARGET_ITEMS,

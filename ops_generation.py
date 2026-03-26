@@ -4,6 +4,7 @@ import traceback
 from time import monotonic, perf_counter
 
 import bpy
+from bpy.props import BoolProperty
 from bpy.types import Context, Object, Operator
 
 from .dependency_manager import get_dependency_status
@@ -257,6 +258,7 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
     bl_label = "AI Interpolation"
     bl_description = "Generate a constrained local motion segment with Kimodo and apply it back to the mapped rig"
     bl_options = {"REGISTER", "UNDO"}
+    show_generation_settings: BoolProperty(default=False, options={"SKIP_SAVE"})  # type: ignore[valid-type]
 
     def invoke(self, context: Context, event) -> set[str]:
         del event
@@ -309,7 +311,19 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
         layout.separator()
         settings_box = layout.box()
         settings_box.enabled = not is_running
-        settings_box.label(text="Generation Settings", icon="SETTINGS")
+        header = settings_box.row(align=True)
+        header.prop(
+            self,
+            "show_generation_settings",
+            text="",
+            icon="TRIA_DOWN" if self.show_generation_settings else "TRIA_RIGHT",
+            emboss=False,
+        )
+        header.label(text="Generation Settings", icon="SETTINGS")
+        if not self.show_generation_settings:
+            layout.separator()
+            _draw_generation_progress(layout, context)
+            return
         settings_box.prop(settings, "model_name")
         settings_box.prop(settings, "diffusion_steps")
         settings_box.prop(settings, "cfg_type")
@@ -380,7 +394,7 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
         if apply_iterator is None:
             return False
 
-        deadline = perf_counter() + 0.008
+        deadline = perf_counter() + 0.004
         stepped = False
         while perf_counter() < deadline:
             try:

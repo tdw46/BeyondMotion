@@ -377,14 +377,24 @@ def _draw_segment_prompt_editor(layout: UILayout, context: Context, armature_obj
 
 def _draw_generation_settings(layout: UILayout, settings) -> None:
     settings_box = layout.box()
-    settings_box.label(text="Generation Settings", icon="SETTINGS")
+    header = settings_box.row(align=True)
+    header.prop(
+        settings,
+        "show_generation_settings",
+        text="",
+        icon="TRIA_DOWN" if settings.show_generation_settings else "TRIA_RIGHT",
+        emboss=False,
+    )
+    header.label(text="Generation Settings", icon="SETTINGS")
+    if not settings.show_generation_settings:
+        return
     settings_box.prop(settings, "model_name")
     settings_box.prop(settings, "diffusion_steps")
     settings_box.prop(settings, "cfg_type")
     if settings.cfg_type != "nocfg":
         settings_box.prop(settings, "cfg_text_weight")
         if settings.cfg_type == "separated":
-                settings_box.prop(settings, "cfg_constraint_weight")
+            settings_box.prop(settings, "cfg_constraint_weight")
     settings_box.prop(settings, "seed")
     settings_box.prop(settings, "apply_postprocess")
     settings_box.prop(settings, "hold_frame_bias")
