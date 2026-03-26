@@ -25,8 +25,11 @@ class GenerationJobHandle:
     response_path: Path
     keep_temp_files: bool
     reader_thread: threading.Thread | None = None
+    result_thread: threading.Thread | None = None
     log_chunks: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
+    loaded_result: tuple[dict[str, np.ndarray], dict, str] | None = None
+    load_error: str | None = None
 
 
 _GENERATION_JOB: GenerationJobHandle | None = None
@@ -44,6 +47,13 @@ _GENERATION_STATE: dict[str, object] = {
 
 _TQDM_PROGRESS_RE = re.compile(r"(?P<pct>\d{1,3})%\|.*?(?P<current>\d+)/(?P<total>\d+)")
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _request_total_frame_count(request: dict[str, object]) -> int:
+    num_frames = request.get("num_frames", 0)
+    if isinstance(num_frames, list):
+        return sum(int(value or 0) for value in num_frames)
+    return int(num_frames or 0)
 
 
 def _set_generation_job_state(**updates: object) -> None:
@@ -251,7 +261,7 @@ def start_generation_job(context: Context, request: dict) -> dict[str, object]:
         detail_text="Launching the Kimodo worker.",
         error_text="",
         model_name=str(request.get("model_name", "")),
-        num_frames=int(request.get("num_frames", 0) or 0),
+        num_frames=_request_total_frame_count(request),
     )
     reader_thread.start()
     return get_generation_job_state()
@@ -272,6 +282,56 @@ def generation_job_ready_to_collect() -> bool:
         return False
     reader_thread = _GENERATION_JOB.reader_thread
     return _GENERATION_JOB.process.poll() is not None and (reader_thread is None or not reader_thread.is_alive())
+
+
+def _load_generation_job_result_background(job: GenerationJobHandle) -> None:
+    try:
+        return_code = job.process.poll()
+        log_output = "".join(job.log_chunks).strip()
+        if return_code != 0:
+            job.load_error = _summarize_worker_error(log_output)
+            return
+
+        response = json.loads(job.response_path.read_text(encoding="utf-8"))
+        output_npz_path = Path(response["output_npz"])
+        with np.load(output_npz_path) as output_data:
+            result = {key: output_data[key] for key in output_data.files}
+        job.loaded_result = (result, response, log_output)
+    except Exception as error:
+        job.load_error = str(error)
+
+
+def begin_collect_generation_job_result() -> bool:
+    job = _GENERATION_JOB
+    if job is None or not generation_job_ready_to_collect():
+        return False
+    if job.loaded_result is not None or job.load_error is not None:
+        return True
+    if job.result_thread is not None:
+        return True
+
+    result_thread = threading.Thread(target=_load_generation_job_result_background, args=(job,), daemon=True)
+    job.result_thread = result_thread
+    _set_generation_job_state(
+        active=True,
+        phase="preparing",
+        progress=max(float(get_generation_job_state().get("progress", 0.0) or 0.0), 0.95),
+        status_text="Preparing generated motion...",
+        detail_text="Loading the generated motion data in the background before applying it in Blender.",
+        error_text="",
+    )
+    result_thread.start()
+    return True
+
+
+def generation_job_result_is_loaded() -> bool:
+    job = _GENERATION_JOB
+    if job is None:
+        return False
+    if job.loaded_result is not None or job.load_error is not None:
+        return True
+    result_thread = job.result_thread
+    return result_thread is not None and not result_thread.is_alive()
 
 
 def cancel_generation_job(reason: str) -> None:
@@ -301,6 +361,11 @@ def cancel_generation_job(reason: str) -> None:
             job.reader_thread.join(timeout=1.0)
     except Exception:
         pass
+    try:
+        if job.result_thread is not None:
+            job.result_thread.join(timeout=1.0)
+    except Exception:
+        pass
     if not job.keep_temp_files:
         shutil.rmtree(job.temp_dir, ignore_errors=True)
     _GENERATION_JOB = None
@@ -321,14 +386,14 @@ def collect_generation_job_result() -> tuple[dict[str, np.ndarray], dict, str]:
         raise RuntimeError("No Beyond Motion generation job is running.")
     if not generation_job_ready_to_collect():
         raise RuntimeError("Beyond Motion generation is still running.")
+    if job.result_thread is not None and job.result_thread.is_alive():
+        raise RuntimeError("Beyond Motion is still preparing the generated motion data.")
 
-    return_code = job.process.poll()
-    log_output = "".join(job.log_chunks).strip()
-    if return_code != 0:
+    if job.load_error is not None:
         if not job.keep_temp_files:
             shutil.rmtree(job.temp_dir, ignore_errors=True)
         _GENERATION_JOB = None
-        error_text = _summarize_worker_error(log_output)
+        error_text = job.load_error
         _set_generation_job_state(
             active=False,
             phase="error",
@@ -339,10 +404,13 @@ def collect_generation_job_result() -> tuple[dict[str, np.ndarray], dict, str]:
         )
         raise RuntimeError(error_text)
 
-    response = json.loads(job.response_path.read_text(encoding="utf-8"))
-    output_npz_path = Path(response["output_npz"])
-    with np.load(output_npz_path) as output_data:
-        result = {key: output_data[key] for key in output_data.files}
+    if job.loaded_result is None:
+        _load_generation_job_result_background(job)
+        if job.load_error is not None:
+            return collect_generation_job_result()
+    if job.loaded_result is None:
+        raise RuntimeError("Beyond Motion could not load the generated motion data.")
+    result, response, log_output = job.loaded_result
 
     if not job.keep_temp_files:
         shutil.rmtree(job.temp_dir, ignore_errors=True)
@@ -391,6 +459,6 @@ def run_generation_job(context: Context, request: dict) -> tuple[dict[str, np.nd
         time.sleep(0.1)
     result, response, log_output = collect_generation_job_result()
     complete_generation_job(
-        f"Generated {int(response.get('num_frames', request.get('num_frames', 0) or 0))} frames with {request.get('model_name', 'kimodo')}."
+        f"Generated {int(response.get('num_frames', _request_total_frame_count(request)) or 0)} frames with {request.get('model_name', 'kimodo')}."
     )
     return result, response, log_output

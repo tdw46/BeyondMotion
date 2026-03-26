@@ -4,19 +4,26 @@ import traceback
 from time import monotonic, perf_counter
 
 import bpy
-from bpy.props import StringProperty
 from bpy.types import Context, Object, Operator
 
 from .dependency_manager import get_dependency_status
 from .preferences import get_preferences
-from .retarget import apply_static_source_motion, build_constraint_request, iter_apply_generated_motion
+from .properties import update_source_frames_from_iterable
+from .retarget import (
+    analyze_prompt_segments,
+    apply_static_source_motion,
+    build_constraint_request,
+    iter_apply_generated_motion,
+)
 from .runtime import (
+    begin_collect_generation_job_result,
     cancel_generation_job,
     collect_generation_job_result,
     complete_generation_job,
     fail_generation_job,
     generation_job_is_active,
     generation_job_ready_to_collect,
+    generation_job_result_is_loaded,
     generation_job_timed_out,
     get_generation_job_state,
     start_generation_job,
@@ -117,6 +124,103 @@ def _draw_prompt_preview(layout, context: Context, prompt: str) -> None:
         preview_box.label(text=line)
 
 
+def _request_total_frame_count(request: dict[str, object] | None) -> int:
+    if not request:
+        return 0
+    num_frames = request.get("num_frames", 0)
+    if isinstance(num_frames, list):
+        return sum(int(value or 0) for value in num_frames)
+    return int(num_frames or 0)
+
+
+def _populate_prompt_segments(settings, analyses, source_frames: list[int]) -> None:
+    settings.prompt_segments.clear()
+    for analysis in analyses:
+        item = settings.prompt_segments.add()
+        item.start_frame = int(analysis.start_frame)
+        item.end_frame = int(analysis.end_frame)
+        item.duration_frames = int(analysis.duration_frames)
+        item.segment_kind = str(analysis.segment_kind)
+        item.prompt = str(analysis.prompt)
+        item.displacement = float(analysis.displacement)
+        item.average_speed = float(analysis.average_speed)
+        item.turn_degrees = float(analysis.turn_degrees)
+    settings.prompt_segments_index = 0
+    update_source_frames_from_iterable(settings, source_frames)
+
+
+def _ensure_prompt_segments(context: Context, armature_object: Object) -> bool:
+    settings = armature_object.data.beyond_motion
+    source_frames = selected_keyframes_for_object(armature_object)
+    if len(source_frames) < 2:
+        return False
+    expected_count = settings.expected_prompt_segment_count(source_frames)
+    if settings.prompt_segments_match_frames(source_frames) and len(settings.prompt_segments) == expected_count:
+        return True
+    analyses = analyze_prompt_segments(context, armature_object, settings, source_frames)
+    _populate_prompt_segments(settings, analyses, source_frames)
+    return True
+
+
+def _active_segment_prompt(settings) -> str:
+    active_segment = settings.active_prompt_segment()
+    if active_segment is None:
+        return ""
+    return str(active_segment.prompt or "")
+
+
+def _draw_segment_prompt_list(layout, context: Context, armature_object: Object, *, enabled: bool) -> None:
+    settings = armature_object.data.beyond_motion
+    selected_frames = selected_keyframes_for_object(armature_object)
+
+    segment_box = layout.box()
+    segment_box.enabled = enabled
+    segment_header = segment_box.row()
+    segment_header.alert = True
+    segment_header.label(text="Segment Prompts", icon="TEXT")
+
+    process_row = segment_box.row()
+    process_row.scale_y = 1.2
+    process_row.operator("beyond_motion.process_keyframes", text="Process Keyframes", icon="ACTION")
+
+    if len(selected_frames) < 2:
+        segment_box.label(text="Select at least two keyframes to create prompt segments.", icon="INFO")
+        return
+
+    if not settings.prompt_segments_match_frames(selected_frames) or not settings.prompt_segments:
+        segment_box.label(text="Process the selected keyframes to build one prompt per span.", icon="INFO")
+        return
+
+    list_row = segment_box.row()
+    list_row.template_list(
+        "BEYONDMOTION_UL_prompt_segments",
+        "",
+        settings,
+        "prompt_segments",
+        settings,
+        "prompt_segments_index",
+        rows=4,
+    )
+
+    active_segment = settings.active_prompt_segment()
+    if active_segment is None:
+        return
+
+    detail_box = segment_box.box()
+    detail_box.prop(active_segment, "segment_kind", text="Action")
+    detail_box.prop(active_segment, "prompt", text="")
+    detail_box.label(
+        text=(
+            f"{active_segment.duration_frames} frames  |  "
+            f"{active_segment.displacement:.2f}m  |  "
+            f"{active_segment.average_speed:.2f}m/s  |  "
+            f"{active_segment.turn_degrees:+.0f} deg"
+        ),
+        icon="INFO",
+    )
+    _draw_prompt_preview(detail_box, context, active_segment.prompt)
+
+
 def _draw_generation_progress(layout, context: Context) -> bool:
     state = _current_generation_ui_state(context)
     active = bool(state.get("active", False))
@@ -154,23 +258,6 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
     bl_description = "Generate a constrained local motion segment with Kimodo and apply it back to the mapped rig"
     bl_options = {"REGISTER", "UNDO"}
 
-    prompt_text: StringProperty(  # type: ignore[valid-type]
-        name="Prompt",
-        description="Text prompt for the full generated segment",
-        options={"TEXTEDIT_UPDATE"},
-    )
-
-    def _sync_prompt_to_settings(self, context: Context) -> None:
-        properties = getattr(self, "properties", None)
-        if properties is None or not properties.is_property_set("prompt_text"):
-            return
-        armature_object = _active_armature_object(context)
-        if armature_object is None:
-            return
-        settings = armature_object.data.beyond_motion
-        if settings.prompt != self.prompt_text:
-            settings.prompt = self.prompt_text
-
     def invoke(self, context: Context, event) -> set[str]:
         del event
         armature_object = _active_armature_object(context)
@@ -178,7 +265,6 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
             self.report({"ERROR"}, "Select an armature first.")
             return {"CANCELLED"}
         if generation_job_is_active():
-            self.prompt_text = armature_object.data.beyond_motion.prompt
             return context.window_manager.invoke_props_dialog(self, width=280)
         runtime_issue = _runtime_ready_issue(context, armature_object)
         if runtime_issue:
@@ -188,12 +274,8 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
         if len(source_frames) < 2:
             self.report({"ERROR"}, "Select at least two keyframes in the Timeline, Dope Sheet, or Graph Editor.")
             return {"CANCELLED"}
-        self.prompt_text = armature_object.data.beyond_motion.prompt
+        _ensure_prompt_segments(context, armature_object)
         return context.window_manager.invoke_props_dialog(self, width=280)
-
-    def check(self, context: Context) -> bool:
-        self._sync_prompt_to_settings(context)
-        return True
 
     def draw(self, context: Context) -> None:
         layout = self.layout
@@ -222,13 +304,7 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
         summary_box.prop(settings, "blender_forward_axis")
 
         layout.separator()
-        prompt_box = layout.box()
-        prompt_box.enabled = not is_running
-        prompt_header = prompt_box.row()
-        prompt_header.alert = True
-        prompt_header.label(text="Movement Prompt", icon="TEXT")
-        prompt_box.prop(self, "prompt_text", text="")
-        _draw_prompt_preview(prompt_box, context, self.prompt_text)
+        _draw_segment_prompt_list(layout, context, armature_object, enabled=not is_running)
 
         layout.separator()
         settings_box = layout.box()
@@ -245,6 +321,7 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
         settings_box.prop(settings, "apply_postprocess")
         settings_box.prop(settings, "hold_frame_bias")
         settings_box.prop(settings, "keypose_match_frames")
+        settings_box.prop(settings, "use_locomotion_root_path")
         layout.separator()
         _draw_generation_progress(layout, context)
 
@@ -314,7 +391,7 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
                 settings_model_name = str(request.get("model_name", "kimodo"))
                 device = response.get("device", "unknown") if isinstance(response, dict) else "unknown"
                 success_text = (
-                    f"Generated {int(request.get('num_frames', 0) or 0)} frames with {settings_model_name} on {device}."
+                    f"Generated {_request_total_frame_count(request)} frames with {settings_model_name} on {device}."
                 )
                 complete_generation_job(success_text)
                 self.report({"INFO"}, success_text)
@@ -380,6 +457,9 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
 
         if not generation_job_ready_to_collect():
             return {"RUNNING_MODAL"}
+        begin_collect_generation_job_result()
+        if not generation_job_result_is_loaded():
+            return {"RUNNING_MODAL"}
 
         try:
             output, response, worker_log = collect_generation_job_result()
@@ -420,19 +500,17 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
 
         settings = armature_object.data.beyond_motion
         settings.ensure_human_bones()
-        self._sync_prompt_to_settings(context)
         runtime_issue = _runtime_ready_issue(context, armature_object)
         if runtime_issue:
             self.report({"ERROR"}, runtime_issue)
             return {"CANCELLED"}
 
-        if not settings.prompt.strip():
-            self.report({"ERROR"}, "Enter a motion prompt before generating.")
-            return {"CANCELLED"}
-
         source_frames = selected_keyframes_for_object(armature_object)
         if len(source_frames) < 2:
             self.report({"ERROR"}, "Select at least two keyframes in the Timeline, Dope Sheet, or Graph Editor.")
+            return {"CANCELLED"}
+        if not _ensure_prompt_segments(context, armature_object):
+            self.report({"ERROR"}, "Process the selected keyframes before generating.")
             return {"CANCELLED"}
 
         try:
@@ -474,5 +552,37 @@ class BEYONDMOTION_OT_generate_inbetweens(Operator):
             frame_count = source_frames[-1] - source_frames[0] + 1
             self.report({"INFO"}, f"Applied a static hold across {frame_count} frames.")
         else:
-            self.report({"INFO"}, f"Generated {request['num_frames']} frames with {settings.model_name} on {device}.")
+            self.report(
+                {"INFO"},
+                f"Generated {_request_total_frame_count(request)} frames with {settings.model_name} on {device}.",
+            )
+        return {"FINISHED"}
+
+
+class BEYONDMOTION_OT_process_keyframes(Operator):
+    bl_idname = "beyond_motion.process_keyframes"
+    bl_label = "Process Keyframes"
+    bl_description = "Analyze the selected keyframes and build one editable AI prompt per keyframe span"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context: Context) -> set[str]:
+        armature_object = _active_armature_object(context)
+        if armature_object is None:
+            self.report({"ERROR"}, "Select an armature first.")
+            return {"CANCELLED"}
+        source_frames = selected_keyframes_for_object(armature_object)
+        if len(source_frames) < 2:
+            self.report({"ERROR"}, "Select at least two keyframes to process.")
+            return {"CANCELLED"}
+
+        settings = armature_object.data.beyond_motion
+        try:
+            analyses = analyze_prompt_segments(context, armature_object, settings, source_frames)
+            _populate_prompt_segments(settings, analyses, source_frames)
+        except Exception as error:
+            traceback.print_exc()
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Processed {len(analyses)} keyframe spans.")
         return {"FINISHED"}

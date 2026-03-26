@@ -47,6 +47,13 @@ HOLD_FRAME_BIAS_ITEMS = (
     ("LAST", "Last Frame", "Delete the last frame in duplicate hold pairs so motion interpolates out of the hold", "TRIA_LEFT", 2),
 )
 
+SEGMENT_KIND_ITEMS = (
+    ("HOLD", "Hold", "Keep the pose held with only subtle settling", "KEYFRAME", 0),
+    ("SHIFT", "Shift Weight", "Stay mostly in place and transfer weight into the next pose", "POSE_HLT", 1),
+    ("WALK", "Walk", "Travel between poses with a natural walk", "ARMATURE_DATA", 2),
+    ("RUN", "Run", "Travel quickly between poses with a natural run", "FORCE_WIND", 3),
+)
+
 
 def update_generation_preview(self, context) -> None:
     del self
@@ -66,6 +73,38 @@ def update_generation_preview(self, context) -> None:
 class BeyondMotionHumanBoneAssignment(PropertyGroup):
     human_bone_name: StringProperty()  # type: ignore[valid-type]
     bone_name: StringProperty(name="Bone")  # type: ignore[valid-type]
+
+
+class BeyondMotionPromptSegment(PropertyGroup):
+    start_frame: IntProperty(name="Start Frame")  # type: ignore[valid-type]
+    end_frame: IntProperty(name="End Frame")  # type: ignore[valid-type]
+    duration_frames: IntProperty(name="Duration")  # type: ignore[valid-type]
+    segment_kind: EnumProperty(  # type: ignore[valid-type]
+        name="Action",
+        items=SEGMENT_KIND_ITEMS,
+        default="SHIFT",
+        description=(
+            "The automatically detected action style for this keyframe span. "
+            "You can change this if you want the default prompt wording to aim for a different behavior."
+        ),
+        update=update_generation_preview,
+    )
+    prompt: StringProperty(  # type: ignore[valid-type]
+        name="Prompt",
+        description=(
+            "The motion prompt used for this keyframe span. "
+            "Edit this text to steer just the active segment without affecting the others."
+        ),
+        options={"TEXTEDIT_UPDATE"},
+        update=update_generation_preview,
+    )
+    displacement: FloatProperty(name="Displacement")  # type: ignore[valid-type]
+    average_speed: FloatProperty(name="Average Speed")  # type: ignore[valid-type]
+    turn_degrees: FloatProperty(name="Turn Degrees")  # type: ignore[valid-type]
+
+    def title(self) -> str:
+        kind_label = dict((item[0], item[1]) for item in SEGMENT_KIND_ITEMS).get(self.segment_kind, self.segment_kind.title())
+        return f"{self.start_frame} to {self.end_frame}  {kind_label}"
 
 
 class BeyondMotionArmatureSettings(PropertyGroup):
@@ -93,7 +132,7 @@ class BeyondMotionArmatureSettings(PropertyGroup):
     )
     diffusion_steps: IntProperty(  # type: ignore[valid-type]
         name="Diffusion Steps",
-        default=100,
+        default=250,
         min=10,
         max=400,
         description=(
@@ -104,7 +143,7 @@ class BeyondMotionArmatureSettings(PropertyGroup):
     cfg_type: EnumProperty(  # type: ignore[valid-type]
         name="CFG",
         items=CFG_TYPE_ITEMS,
-        default="separated",
+        default="regular",
         description=(
             "Controls how strongly the model follows your text prompt versus your keyed pose constraints. "
             "Separated gives the most control, Regular is simpler, and Off is the loosest and least guided."
@@ -160,8 +199,16 @@ class BeyondMotionArmatureSettings(PropertyGroup):
         min=0,
         max=12,
         description=(
-            "How many frames on each side of your kept keyed poses should blend back toward the original animation after generation. "
-            "Set this to 0 to skip the additive pose-match pass. Higher values add an Animation Layers-style correction that matches your original keyed poses more exactly, while surrounding frames ease into and out of them."
+            "Set this above 0 to enable the additive pose-match pass after generation. "
+            "This blends the original keyed poses back into the generated motion using an Animation Layers-style offset correction between neighboring key poses. Set it to 0 to skip that correction."
+        ),
+    )
+    use_locomotion_root_path: BoolProperty(  # type: ignore[valid-type]
+        name="Root Path for Locomotion",
+        default=True,
+        description=(
+            "Add an automatic root path guide on walking and running spans. "
+            "This helps locomotion stay grounded and directional, but you can turn it off if a rig behaves better without that extra path guidance."
         ),
     )
     root_target_mode: EnumProperty(  # type: ignore[valid-type]
@@ -190,6 +237,8 @@ class BeyondMotionArmatureSettings(PropertyGroup):
         ),
     )
     human_bones: CollectionProperty(type=BeyondMotionHumanBoneAssignment)  # type: ignore[valid-type]
+    prompt_segments: CollectionProperty(type=BeyondMotionPromptSegment)  # type: ignore[valid-type]
+    prompt_segments_index: IntProperty(default=0)  # type: ignore[valid-type]
 
     def ensure_human_bones(self) -> None:
         existing = {item.human_bone_name for item in self.human_bones}
@@ -225,6 +274,32 @@ class BeyondMotionArmatureSettings(PropertyGroup):
         for bone_name in self.assignment_map().values():
             counts[bone_name] = counts.get(bone_name, 0) + 1
         return {bone_name for bone_name, count in counts.items() if count > 1}
+
+    def active_prompt_segment(self) -> BeyondMotionPromptSegment | None:
+        if not self.prompt_segments:
+            return None
+        index = max(0, min(int(self.prompt_segments_index), len(self.prompt_segments) - 1))
+        return self.prompt_segments[index]
+
+    def prompt_segments_match_frames(self, source_frames: list[int]) -> bool:
+        if len(source_frames) < 2:
+            return False
+        frame_pairs = [
+            (int(frame_a), int(frame_b))
+            for frame_a, frame_b in zip(source_frames, source_frames[1:])
+            if int(frame_b) - int(frame_a) >= 3
+        ]
+        if len(self.prompt_segments) != len(frame_pairs):
+            return False
+        for item, (frame_a, frame_b) in zip(self.prompt_segments, frame_pairs):
+            if int(item.start_frame) != int(frame_a) or int(item.end_frame) != int(frame_b):
+                return False
+        return True
+
+    def expected_prompt_segment_count(self, source_frames: list[int]) -> int:
+        if len(source_frames) < 2:
+            return 0
+        return sum(1 for frame_a, frame_b in zip(source_frames, source_frames[1:]) if int(frame_b) - int(frame_a) >= 3)
 
 
 def parse_source_frames(text: str) -> list[int]:

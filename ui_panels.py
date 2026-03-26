@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import bpy
-from bpy.types import Armature, Context, Object, Panel, UILayout
+from bpy.types import Armature, Context, Object, Panel, UILayout, UIList
 
 from .dependency_manager import (
     LOCAL_GENERATION_VRAM_GB,
@@ -11,11 +11,14 @@ from .dependency_manager import (
 )
 from .human_bones import HumanBoneSpecification, HumanBoneSpecifications
 from .preferences import get_preferences
+from .properties import update_source_frames_from_iterable
+from .retarget import analyze_prompt_segments
 from .runtime import get_generation_job_state
 from .runtime_setup import get_runtime_asset_job_state, get_runtime_setup_status
 from .utils import selected_keyframes_for_object, wrap_text_to_panel
 
 _PENDING_HUMAN_BONE_INITIALIZATIONS: set[str] = set()
+_PENDING_PROMPT_SEGMENT_REFRESHES: set[tuple[str, tuple[int, ...]]] = set()
 _UI_STATE_KEYS = {
     "active": "_beyond_motion_generation_active",
     "progress": "_beyond_motion_generation_progress",
@@ -78,6 +81,53 @@ def _initialize_human_bones_later(armature_data_name: str):
     if armature_data_name in _PENDING_HUMAN_BONE_INITIALIZATIONS:
         return
     _PENDING_HUMAN_BONE_INITIALIZATIONS.add(armature_data_name)
+    bpy.app.timers.register(_run, first_interval=0.01)
+
+
+def _populate_prompt_segments(settings, analyses, source_frames: list[int]) -> None:
+    settings.prompt_segments.clear()
+    for analysis in analyses:
+        item = settings.prompt_segments.add()
+        item.start_frame = int(analysis.start_frame)
+        item.end_frame = int(analysis.end_frame)
+        item.duration_frames = int(analysis.duration_frames)
+        item.segment_kind = str(analysis.segment_kind)
+        item.prompt = str(analysis.prompt)
+        item.displacement = float(analysis.displacement)
+        item.average_speed = float(analysis.average_speed)
+        item.turn_degrees = float(analysis.turn_degrees)
+    settings.prompt_segments_index = 0
+    update_source_frames_from_iterable(settings, source_frames)
+
+
+def _schedule_prompt_segment_refresh(armature_object: Object, source_frames: list[int]) -> None:
+    if len(source_frames) < 2:
+        return
+    refresh_key = (armature_object.name, tuple(int(frame) for frame in source_frames))
+    if refresh_key in _PENDING_PROMPT_SEGMENT_REFRESHES:
+        return
+
+    def _run():
+        _PENDING_PROMPT_SEGMENT_REFRESHES.discard(refresh_key)
+        armature = bpy.data.objects.get(armature_object.name)
+        if armature is None or armature.type != "ARMATURE":
+            return None
+        current_frames = selected_keyframes_for_object(armature)
+        if tuple(int(frame) for frame in current_frames) != refresh_key[1]:
+            return None
+        settings = armature.data.beyond_motion
+        expected_count = settings.expected_prompt_segment_count(current_frames)
+        if settings.prompt_segments_match_frames(current_frames) and len(settings.prompt_segments) == expected_count:
+            return None
+        try:
+            analyses = analyze_prompt_segments(bpy.context, armature, settings, current_frames)
+            _populate_prompt_segments(settings, analyses, current_frames)
+        except Exception as error:
+            print(f"Beyond Motion: failed to refresh prompt segments: {error}")
+        _tag_relevant_redraw()
+        return None
+
+    _PENDING_PROMPT_SEGMENT_REFRESHES.add(refresh_key)
     bpy.app.timers.register(_run, first_interval=0.01)
 
 
@@ -271,6 +321,60 @@ def _draw_prompt_preview(layout: UILayout, context: Context, prompt: str) -> Non
         preview_box.label(text=line)
 
 
+def _draw_segment_prompt_editor(layout: UILayout, context: Context, armature_object: Object, *, enabled: bool) -> None:
+    settings = armature_object.data.beyond_motion
+    selected_frames = selected_keyframes_for_object(armature_object)
+
+    prompt_box = layout.box()
+    prompt_box.enabled = enabled
+    prompt_header = prompt_box.row()
+    prompt_header.alert = True
+    prompt_header.label(text="Segment Prompts", icon="TEXT")
+
+    process_row = prompt_box.row()
+    process_row.scale_y = 1.2
+    process_row.operator("beyond_motion.process_keyframes", text="Process Keyframes", icon="ACTION")
+
+    if len(selected_frames) < 2:
+        prompt_box.label(text="Select at least two keyframes to create prompt segments.", icon="INFO")
+        return
+
+    if not settings.prompt_segments_match_frames(selected_frames) or not settings.prompt_segments:
+        _schedule_prompt_segment_refresh(armature_object, selected_frames)
+        prompt_box.label(text="Process the selected keyframes to build one editable prompt per span.", icon="INFO")
+        prompt_box.label(text="Refreshing the selected keyframes for AI prompts...", icon="TIME")
+        return
+
+    list_row = prompt_box.row()
+    list_row.template_list(
+        "BEYONDMOTION_UL_prompt_segments",
+        "",
+        settings,
+        "prompt_segments",
+        settings,
+        "prompt_segments_index",
+        rows=4,
+    )
+
+    active_segment = settings.active_prompt_segment()
+    if active_segment is None:
+        return
+
+    detail_box = prompt_box.box()
+    detail_box.prop(active_segment, "segment_kind", text="Action")
+    detail_box.prop(active_segment, "prompt", text="")
+    detail_box.label(
+        text=(
+            f"{active_segment.duration_frames} frames  |  "
+            f"{active_segment.displacement:.2f}m  |  "
+            f"{active_segment.average_speed:.2f}m/s  |  "
+            f"{active_segment.turn_degrees:+.0f} deg"
+        ),
+        icon="INFO",
+    )
+    _draw_prompt_preview(detail_box, context, active_segment.prompt)
+
+
 def _draw_generation_settings(layout: UILayout, settings) -> None:
     settings_box = layout.box()
     settings_box.label(text="Generation Settings", icon="SETTINGS")
@@ -285,6 +389,7 @@ def _draw_generation_settings(layout: UILayout, settings) -> None:
     settings_box.prop(settings, "apply_postprocess")
     settings_box.prop(settings, "hold_frame_bias")
     settings_box.prop(settings, "keypose_match_frames")
+    settings_box.prop(settings, "use_locomotion_root_path")
 
 
 def _draw_generation_progress(layout: UILayout, context: Context) -> bool:
@@ -314,6 +419,16 @@ def _draw_generation_progress(layout: UILayout, context: Context) -> bool:
         for line in (wrapped_detail.splitlines() or [""]):
             progress_box.label(text=line)
     return True
+
+
+def _prompt_segments_ready(settings, selected_frames: list[int]) -> bool:
+    if len(selected_frames) < 2:
+        return False
+    if not settings.prompt_segments_match_frames(selected_frames):
+        return False
+    if len(settings.prompt_segments) != len(selected_frames) - 1:
+        return False
+    return all(str(item.prompt or "").strip() for item in settings.prompt_segments)
 
 
 def _draw_generation_button(layout: UILayout, *, enabled: bool, running: bool = False) -> None:
@@ -677,6 +792,27 @@ class BEYONDMOTION_PT_main(Panel):
         _draw_generation_progress(layout, context)
 
 
+class BEYONDMOTION_UL_prompt_segments(UIList):
+    bl_idname = "BEYONDMOTION_UL_prompt_segments"
+
+    def draw_item(
+        self,
+        context: Context,
+        layout: UILayout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index=0,
+        flt_flag=0,
+    ) -> None:
+        del context, data, icon, active_data, active_propname, index, flt_flag
+        row = layout.row(align=True)
+        row.label(text=f"{item.start_frame} to {item.end_frame}", icon="ACTION")
+        row.label(text=item.segment_kind.replace("_", " ").title())
+
+
 class BEYONDMOTION_PT_generate(Panel):
     bl_label = "AI Interpolation"
     bl_idname = "BEYONDMOTION_PT_generate"
@@ -731,12 +867,7 @@ class BEYONDMOTION_PT_generate(Panel):
             return
         selected_frames = _draw_generation_status(layout, context, armature_object, armature_data, settings)
 
-        prompt_box = layout.box()
-        prompt_header = prompt_box.row()
-        prompt_header.alert = True
-        prompt_header.label(text="Movement Prompt", icon="TEXT")
-        prompt_box.prop(settings, "prompt", text="")
-        _draw_prompt_preview(prompt_box, context, settings.prompt)
+        _draw_segment_prompt_editor(layout, context, armature_object, enabled=not bool(get_generation_job_state().get("active", False)))
 
         layout.separator()
         _draw_generation_settings(layout, settings)
@@ -747,7 +878,7 @@ class BEYONDMOTION_PT_generate(Panel):
         layout.separator()
         _draw_generation_button(
             layout,
-            enabled=len(selected_frames) >= 2 and bool(settings.prompt.strip()),
+            enabled=_prompt_segments_ready(settings, selected_frames),
             running=bool(get_generation_job_state().get("active", False)),
         )
         layout.separator()

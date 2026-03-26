@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import atan2, degrees
+import re
 from typing import Any, Iterator
 
 import bpy
@@ -171,6 +173,10 @@ SOMA77_PARENT = {
     "RightToeEnd": "RightToeBase",
 }
 HUMAN_BONE_PROCESS_ORDER = {spec.name: index for index, spec in enumerate(HumanBoneSpecifications.ALL)}
+WEIGHT_SHIFT_SPEED_MPS = 0.30
+WALKING_SPEED_MAX_MPS = 2.10
+TURN_PROMPT_THRESHOLD_DEGREES = 5.0
+MIN_HEURISTIC_SEGMENT_FRAMES = 3
 
 CANONICAL_TO_SOMA = {
     "hips": "Hips",
@@ -242,6 +248,30 @@ class CapturedSourceData:
     first_root_control_location: Any
     generation_required: bool
     source_loop_matches: bool
+    injected_turn_frames: tuple[int, ...] = ()
+
+
+@dataclass
+class PromptSegmentAnalysis:
+    start_frame: int
+    end_frame: int
+    duration_frames: int
+    segment_kind: str
+    prompt: str
+    displacement: float
+    average_speed: float
+    turn_degrees: float
+
+
+@dataclass
+class InternalPromptSegment:
+    start_frame: int
+    end_frame: int
+    num_frames: int
+    prompt: str
+    segment_kind: str
+    path_frames: tuple[int, ...] = ()
+    turn_degrees: float = 0.0
 
 
 def axis_angle_vector_from_matrix(matrix: Matrix) -> list[float]:
@@ -623,6 +653,8 @@ def _capture_root_control_location(
     pose_bone = _get_pose_bone(armature_object, identifier)
     if pose_bone is None:
         return Vector((0.0, 0.0, 0.0))
+    if settings.root_target_mode == "MOTION_ROOT":
+        return pose_bone.matrix.translation.copy()
     return pose_bone.location.copy()
 
 
@@ -640,6 +672,17 @@ def _set_root_control_location(
     pose_bone = _get_pose_bone(armature_object, identifier)
     if pose_bone is None:
         return
+    if settings.root_target_mode == "MOTION_ROOT":
+        parent_pose_matrix = pose_bone.parent.matrix.copy() if pose_bone.parent is not None else None
+        target_pose_matrix = pose_bone.matrix.copy()
+        target_pose_matrix.translation = location
+        basis_matrix = _basis_matrix_from_target_pose_matrix(
+            pose_bone,
+            target_pose_matrix,
+            parent_pose_matrix,
+        )
+        _apply_location_to_pose_bone(pose_bone, basis_matrix.to_translation(), frame)
+        return
     pose_bone.location = location
     pose_bone.keyframe_insert(data_path="location", frame=frame)
 
@@ -656,6 +699,590 @@ def _capture_local_pose_sample(
             continue
         rotations[human_bone_name] = _matrix_basis_rotation(pose_bone).copy()
     return rotations, _capture_root_control_location(armature_object, settings).copy()
+
+
+def _capture_source_keyframe_data(
+    context: Context,
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    source_frames: list[int],
+    assignment_map: dict[str, str],
+    hips_bone: PoseBone,
+) -> tuple[
+    dict[int, dict[str, Matrix]],
+    dict[int, Vector],
+    dict[int, Vector],
+    dict[int, float | None],
+    dict[int, float | None],
+]:
+    scene = context.scene
+    original_frame = scene.frame_current
+    source_rotations: dict[int, dict[str, Matrix]] = {}
+    root_control_locations: dict[int, Vector] = {}
+    source_root_positions: dict[int, Vector] = {}
+    hips_heading_degrees: dict[int, float | None] = {}
+    root_heading_degrees: dict[int, float | None] = {}
+
+    try:
+        for frame in source_frames:
+            scene.frame_set(frame)
+            context.view_layer.update()
+
+            frame_rotations: dict[str, Matrix] = {}
+            for human_bone_name, blender_bone_name in assignment_map.items():
+                pose_bone = _get_pose_bone(armature_object, blender_bone_name)
+                if pose_bone is None:
+                    continue
+                frame_rotations[human_bone_name] = _matrix_basis_rotation(pose_bone).copy()
+
+            source_rotations[frame] = frame_rotations
+            source_root_positions[frame] = hips_bone.head.copy()
+            root_control_locations[frame] = _capture_root_control_location(armature_object, settings)
+            hips_heading_degrees[frame] = _rotation_heading_degrees(
+                armature_object,
+                _bone_pose_global_delta_rotation(hips_bone),
+                settings.blender_forward_axis,
+            )
+            root_identifier = _target_root_identifier(settings)
+            if root_identifier == "OBJECT":
+                root_heading_degrees[frame] = _heading_degrees_from_direction(
+                    armature_object.matrix_world.to_3x3() @ _forward_axis_vector(settings.blender_forward_axis)
+                )
+            else:
+                root_pose_bone = _get_pose_bone(armature_object, root_identifier)
+                root_heading_degrees[frame] = (
+                    _rotation_heading_degrees(
+                        armature_object,
+                        _bone_pose_global_delta_rotation(root_pose_bone),
+                        settings.blender_forward_axis,
+                    )
+                    if root_pose_bone is not None
+                    else None
+                )
+    finally:
+        scene.frame_set(original_frame)
+        context.view_layer.update()
+
+    return (
+        source_rotations,
+        root_control_locations,
+        source_root_positions,
+        hips_heading_degrees,
+        root_heading_degrees,
+    )
+
+
+def _scene_fps(context: Context) -> float:
+    render = context.scene.render
+    fps = float(getattr(render, "fps", 24.0) or 24.0)
+    fps_base = float(getattr(render, "fps_base", 1.0) or 1.0)
+    return fps / fps_base if fps_base else fps
+
+
+def _segment_prompt_text(segment_kind: str, *, large_distance: bool = False) -> str:
+    if segment_kind == "HOLD":
+        return "A person naturally holds the same pose with subtle breathing and balance adjustments."
+    if segment_kind == "SHIFT":
+        if large_distance:
+            return "A person turns in place and naturally shifts weight into the next pose without stepping far away."
+        return "A person stays mostly in place and naturally shifts weight into the next pose."
+    if segment_kind == "RUN":
+        return "A person runs naturally through the keyed poses with clear momentum and grounded footfalls."
+    return "A person walks at a natural relaxed pace through the keyed poses."
+
+
+def _forward_axis_vector(forward_axis: str) -> Vector:
+    if forward_axis == "NEGATIVE_Y":
+        return Vector((0.0, -1.0, 0.0))
+    if forward_axis == "POSITIVE_Y":
+        return Vector((0.0, 1.0, 0.0))
+    if forward_axis == "POSITIVE_X":
+        return Vector((1.0, 0.0, 0.0))
+    return Vector((-1.0, 0.0, 0.0))
+
+
+def _signed_heading_delta_degrees(start_heading: float, end_heading: float) -> float:
+    delta = end_heading - start_heading
+    while delta > 180.0:
+        delta -= 360.0
+    while delta < -180.0:
+        delta += 360.0
+    return delta
+
+
+def _heading_degrees_from_direction(direction: Vector) -> float | None:
+    planar = Vector((direction.x, direction.y, 0.0))
+    if planar.length <= 1.0e-6:
+        return None
+    planar.normalize()
+    return degrees(atan2(planar.y, planar.x))
+
+
+def _rotation_heading_degrees(
+    armature_object: Object,
+    rotation_matrix: Matrix,
+    forward_axis: str,
+) -> float | None:
+    world_rotation = armature_object.matrix_world.to_3x3()
+    forward_direction = world_rotation @ (rotation_matrix @ _forward_axis_vector(forward_axis))
+    return _heading_degrees_from_direction(forward_direction)
+
+
+def _average_turn_delta_degrees(
+    hips_heading_degrees: dict[int, float | None],
+    root_heading_degrees: dict[int, float | None],
+    frame_a: int,
+    frame_b: int,
+) -> float:
+    contributors: list[float] = []
+    hips_start = hips_heading_degrees.get(frame_a)
+    hips_end = hips_heading_degrees.get(frame_b)
+    if hips_start is not None and hips_end is not None:
+        contributors.append(_signed_heading_delta_degrees(hips_start, hips_end))
+
+    root_start = root_heading_degrees.get(frame_a)
+    root_end = root_heading_degrees.get(frame_b)
+    if root_start is not None and root_end is not None:
+        contributors.append(_signed_heading_delta_degrees(root_start, root_end))
+
+    if not contributors:
+        return 0.0
+    return sum(contributors) / float(len(contributors))
+
+
+def _average_heading_degrees(
+    hips_heading_degrees: dict[int, float | None],
+    root_heading_degrees: dict[int, float | None],
+    frame: int,
+) -> float | None:
+    contributors = [
+        value
+        for value in (
+            hips_heading_degrees.get(frame),
+            root_heading_degrees.get(frame),
+        )
+        if value is not None
+    ]
+    if not contributors:
+        return None
+    return sum(contributors) / float(len(contributors))
+
+
+def _direction_from_heading_degrees(heading_degrees: float) -> Vector:
+    radians = np.deg2rad(heading_degrees)
+    return Vector((float(np.cos(radians)), float(np.sin(radians)), 0.0))
+
+
+def _target_is_in_front(
+    start_position: Vector,
+    end_position: Vector,
+    start_heading_degrees: float | None,
+) -> bool:
+    if start_heading_degrees is None:
+        return False
+    displacement = Vector((end_position.x - start_position.x, end_position.y - start_position.y, 0.0))
+    if displacement.length <= 1.0e-6:
+        return False
+    forward = _direction_from_heading_degrees(start_heading_degrees)
+    return displacement.dot(forward) > 0.0
+
+
+def _turn_phrase(turn_degrees: float, *, gradual_threshold: float = 45.0) -> str:
+    magnitude = abs(turn_degrees)
+    rounded = int(round(magnitude))
+    if rounded <= 0:
+        return ""
+    direction = "left" if turn_degrees >= 0.0 else "right"
+    if magnitude < gradual_threshold:
+        return f"gradually turns {direction} by {rounded} degrees"
+    return f"turns {direction} by {rounded} degrees"
+
+
+def _prompt_for_segment(segment_kind: str, turn_degrees: float, *, large_distance: bool = False) -> str:
+    turn_phrase = _turn_phrase(turn_degrees)
+    if segment_kind in {"WALK", "RUN"} and turn_phrase:
+        if segment_kind == "RUN":
+            if abs(turn_degrees) < 45.0:
+                return (
+                    f"A person {turn_phrase} while running naturally through the keyed poses with clear momentum "
+                    "and grounded footfalls."
+                )
+            return (
+                f"A person {turn_phrase}, then runs naturally through the keyed poses with clear momentum "
+                "and grounded footfalls."
+            )
+        if abs(turn_degrees) < 45.0:
+            return f"A person {turn_phrase} while walking at a natural relaxed pace through the keyed poses."
+        return f"A person {turn_phrase}, then walks at a natural relaxed pace through the keyed poses."
+
+    if segment_kind in {"HOLD", "SHIFT"} and abs(turn_degrees) >= TURN_PROMPT_THRESHOLD_DEGREES:
+        return f"A person {_turn_phrase(turn_degrees)} then holds the new pose."
+
+    return _segment_prompt_text(segment_kind, large_distance=large_distance)
+
+
+def _short_span_prompt(segment_kind: str, poses_match: bool) -> str:
+    if poses_match or segment_kind == "HOLD":
+        return "A person naturally holds the same pose with subtle breathing and balance adjustments."
+    return "A person smoothly transitions into the next pose."
+
+
+def analyze_prompt_segments(
+    context: Context,
+    armature_object: Object,
+    settings: BeyondMotionArmatureSettings,
+    source_frames: list[int],
+) -> list[PromptSegmentAnalysis]:
+    if len(source_frames) < 2:
+        return []
+
+    settings.ensure_human_bones()
+    assignment_map = settings.assignment_map()
+    hips_bone_name = assignment_map.get("hips")
+    hips_bone = _get_pose_bone(armature_object, hips_bone_name or "")
+    if hips_bone is None:
+        raise ValueError("A hips bone assignment is required.")
+
+    source_rotations, root_control_locations, source_root_positions, hips_heading_degrees, root_heading_degrees = _capture_source_keyframe_data(
+        context,
+        armature_object,
+        settings,
+        source_frames,
+        assignment_map,
+        hips_bone,
+    )
+    fps = max(_scene_fps(context), 1.0)
+    analyses: list[PromptSegmentAnalysis] = []
+    for frame_a, frame_b in zip(source_frames, source_frames[1:]):
+        duration_frames = max(int(frame_b - frame_a), 1)
+        if duration_frames < MIN_HEURISTIC_SEGMENT_FRAMES:
+            continue
+        duration_seconds = max(duration_frames / fps, 1.0 / fps)
+        displacement = float((source_root_positions[frame_b] - source_root_positions[frame_a]).length)
+        average_speed = displacement / duration_seconds
+        poses_match = _frames_match_pose(frame_a, frame_b, source_rotations, root_control_locations)
+        turn_degrees = _average_turn_delta_degrees(hips_heading_degrees, root_heading_degrees, frame_a, frame_b)
+
+        hips_a = source_rotations.get(frame_a, {}).get("hips")
+        hips_b = source_rotations.get(frame_b, {}).get("hips")
+        hips_turn = _rotation_distance(hips_a, hips_b) if hips_a is not None and hips_b is not None else 0.0
+
+        if poses_match:
+            segment_kind = "HOLD"
+        elif displacement < 0.06 or average_speed < WEIGHT_SHIFT_SPEED_MPS:
+            segment_kind = "SHIFT"
+        elif average_speed <= WALKING_SPEED_MAX_MPS:
+            segment_kind = "WALK"
+        else:
+            segment_kind = "RUN"
+
+        prompt = _prompt_for_segment(
+            segment_kind,
+            turn_degrees,
+            large_distance=(segment_kind == "SHIFT" and hips_turn >= 0.45),
+        )
+        analyses.append(
+            PromptSegmentAnalysis(
+                start_frame=int(frame_a),
+                end_frame=int(frame_b),
+                duration_frames=duration_frames,
+                segment_kind=segment_kind,
+                prompt=prompt,
+                displacement=displacement,
+                average_speed=average_speed,
+                turn_degrees=turn_degrees,
+            )
+        )
+    return analyses
+
+
+def prompt_segments_from_settings(
+    settings: BeyondMotionArmatureSettings,
+    source_frames: list[int],
+) -> list[dict[str, Any]]:
+    if not settings.prompt_segments_match_frames(source_frames):
+        return []
+    segments: list[dict[str, Any]] = []
+    for item in settings.prompt_segments:
+        prompt = str(item.prompt or "").strip()
+        segments.append(
+            {
+                "start_frame": int(item.start_frame),
+                "end_frame": int(item.end_frame),
+                "duration_frames": max(int(item.duration_frames), 1),
+                "segment_kind": str(item.segment_kind or "SHIFT"),
+                "prompt": prompt,
+                "turn_degrees": float(item.turn_degrees or 0.0),
+            }
+        )
+    return segments
+
+
+def _request_num_frames_by_segment(source_frames: list[int]) -> list[int]:
+    if len(source_frames) < 2:
+        return []
+    num_frames: list[int] = []
+    for index, (frame_a, frame_b) in enumerate(zip(source_frames, source_frames[1:])):
+        segment_frames = int(frame_b - frame_a)
+        if index == len(source_frames) - 2:
+            segment_frames += 1
+        num_frames.append(max(segment_frames, 1))
+    return num_frames
+
+
+def _build_root2d_constraint(
+    frame_start: int,
+    root_positions_by_frame: dict[int, Vector],
+    prompt_segments: list[InternalPromptSegment],
+    forward_axis: str,
+) -> dict[str, Any] | None:
+    root2d_by_frame: dict[int, list[float]] = {}
+    for segment in prompt_segments:
+        if segment.segment_kind not in {"WALK", "RUN"}:
+            continue
+        anchor_frames = tuple(
+            frame
+            for frame in (segment.path_frames or (segment.start_frame, segment.end_frame))
+            if frame in root_positions_by_frame
+        )
+        if len(anchor_frames) < 2:
+            continue
+        for start_frame, end_frame in zip(anchor_frames, anchor_frames[1:]):
+            start_frame = int(start_frame)
+            end_frame = int(end_frame)
+            start_root = root_positions_by_frame.get(start_frame)
+            end_root = root_positions_by_frame.get(end_frame)
+            if start_root is None or end_root is None or end_frame <= start_frame:
+                continue
+            frame_span = max(end_frame - start_frame, 1)
+            for scene_frame in range(start_frame, end_frame + 1):
+                factor = (scene_frame - start_frame) / float(frame_span)
+                blended_root = _blend_vectors(start_root, end_root, factor)
+                kimodo_position = blender_position_to_kimodo(blended_root, forward_axis)
+                root2d_by_frame[scene_frame - frame_start] = [kimodo_position[0], kimodo_position[2]]
+
+    if not root2d_by_frame:
+        return None
+
+    ordered_frames = sorted(root2d_by_frame)
+    return {
+        "type": "root2d",
+        "frame_indices": ordered_frames,
+        "smooth_root_2d": [root2d_by_frame[frame] for frame in ordered_frames],
+    }
+
+
+def _turn_only_prompt(turn_degrees: float) -> str:
+    turn_phrase = _turn_phrase(turn_degrees, gradual_threshold=45.0)
+    if not turn_phrase:
+        return "A person quickly reorients into the new facing direction."
+    return f"A person {turn_phrase}."
+
+
+def _straight_locomotion_prompt(segment_kind: str) -> str:
+    if segment_kind == "RUN":
+        return "A person runs naturally through the keyed poses with clear momentum and grounded footfalls."
+    return "A person walks at a natural relaxed pace through the keyed poses."
+
+
+def _merged_locomotion_prompt(segment_kind: str, total_turn_degrees: float) -> str:
+    base_prompt = _straight_locomotion_prompt(segment_kind)
+    if abs(total_turn_degrees) < 10.0 or abs(total_turn_degrees) >= 45.0:
+        return base_prompt
+
+    turn_phrase = _turn_phrase(total_turn_degrees, gradual_threshold=45.0)
+    if not turn_phrase:
+        return base_prompt
+    if segment_kind == "RUN":
+        return f"A person {turn_phrase} while running naturally through the keyed poses with clear momentum and grounded footfalls."
+    return f"A person {turn_phrase} while walking at a natural relaxed pace through the keyed poses."
+
+
+def _merge_path_frames(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...]:
+    merged: list[int] = []
+    for frame in (*a, *b):
+        if not merged or merged[-1] != int(frame):
+            merged.append(int(frame))
+    return tuple(merged)
+
+
+def _merge_internal_locomotion_segments(
+    internal_segments: list[InternalPromptSegment],
+) -> list[InternalPromptSegment]:
+    if not internal_segments:
+        return []
+
+    merged_segments: list[InternalPromptSegment] = []
+    for segment in internal_segments:
+        if (
+            merged_segments
+            and segment.segment_kind in {"WALK", "RUN"}
+            and merged_segments[-1].segment_kind == segment.segment_kind
+            and segment.start_frame <= (merged_segments[-1].end_frame + 1)
+        ):
+            previous = merged_segments[-1]
+            combined_turn = previous.turn_degrees + segment.turn_degrees
+            merged_segments[-1] = InternalPromptSegment(
+                start_frame=previous.start_frame,
+                end_frame=max(previous.end_frame, segment.end_frame),
+                num_frames=1,
+                prompt=_merged_locomotion_prompt(segment.segment_kind, combined_turn),
+                segment_kind=segment.segment_kind,
+                path_frames=_merge_path_frames(previous.path_frames, segment.path_frames),
+                turn_degrees=combined_turn,
+            )
+            continue
+        merged_segments.append(segment)
+    return merged_segments
+
+
+def _prompt_without_turn_instruction(prompt: str, segment_kind: str) -> str:
+    cleaned = str(prompt or "").strip()
+    if not cleaned:
+        return _straight_locomotion_prompt(segment_kind)
+
+    patterns = (
+        r"^A person gradually turns (?:left|right) by \d+ degrees and (.+)$",
+        r"^A person turns (?:left|right) by \d+ degrees, then (.+)$",
+        r"^A person turns (?:left|right) by \d+ degrees then (.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+        if not match:
+            continue
+        remainder = match.group(1).strip()
+        if not remainder:
+            break
+        if remainder.lower().startswith("a person "):
+            return remainder
+        return f"A person {remainder[0].lower() + remainder[1:]}" if remainder else _straight_locomotion_prompt(segment_kind)
+    return cleaned
+
+
+def _build_internal_prompt_plan(
+    context: Context,
+    visible_prompt_segments: list[dict[str, Any]],
+    source_root_positions: dict[int, Vector],
+    hips_heading_degrees: dict[int, float | None],
+    root_heading_degrees: dict[int, float | None],
+) -> tuple[list[InternalPromptSegment], dict[int, dict[str, Any]]]:
+    fps = max(_scene_fps(context), 1.0)
+    internal_segments: list[InternalPromptSegment] = []
+    injected_turn_frames: dict[int, dict[str, Any]] = {}
+
+    for segment in visible_prompt_segments:
+        start_frame = int(segment["start_frame"])
+        end_frame = int(segment["end_frame"])
+        segment_kind = str(segment["segment_kind"])
+        prompt = str(segment["prompt"])
+        turn_degrees = float(segment.get("turn_degrees", 0.0) or 0.0)
+        duration_frames = max(end_frame - start_frame, 1)
+
+        if (
+            segment_kind in {"WALK", "RUN"}
+            and duration_frames >= MIN_HEURISTIC_SEGMENT_FRAMES
+            and abs(turn_degrees) >= 45.0
+            and end_frame > start_frame + 2
+        ):
+            seconds = 0.5 if segment_kind == "RUN" else 0.8
+            offset_frames = max(1, int(round(seconds * fps)))
+            end_is_in_front = _target_is_in_front(
+                source_root_positions[start_frame],
+                source_root_positions[end_frame],
+                _average_heading_degrees(hips_heading_degrees, root_heading_degrees, start_frame),
+            )
+            if end_is_in_front:
+                locomotion_end_frame = max(start_frame + 1, end_frame - offset_frames)
+                turn_start_frame = locomotion_end_frame + 1
+                if locomotion_end_frame < end_frame and turn_start_frame < end_frame:
+                    injected_info = {
+                        "start_frame": start_frame,
+                        "end_frame": end_frame,
+                        "segment_kind": segment_kind,
+                        "inject_mode": "END",
+                    }
+                    injected_turn_frames[locomotion_end_frame] = dict(injected_info)
+                    injected_turn_frames[turn_start_frame] = dict(injected_info)
+                    source_root_positions[locomotion_end_frame] = source_root_positions[end_frame].copy()
+                    source_root_positions[turn_start_frame] = source_root_positions[end_frame].copy()
+                    internal_segments.append(
+                        InternalPromptSegment(
+                            start_frame=start_frame,
+                            end_frame=locomotion_end_frame,
+                            num_frames=1,
+                            prompt=_prompt_without_turn_instruction(prompt, segment_kind),
+                            segment_kind=segment_kind,
+                            path_frames=(start_frame, locomotion_end_frame),
+                        )
+                    )
+                    internal_segments.append(
+                        InternalPromptSegment(
+                            start_frame=turn_start_frame,
+                            end_frame=end_frame,
+                            num_frames=1,
+                            prompt=_turn_only_prompt(turn_degrees),
+                            segment_kind="TURN",
+                            turn_degrees=turn_degrees,
+                        )
+                    )
+                    continue
+
+            turn_end_frame = min(start_frame + offset_frames, end_frame - 2)
+            turn_start_frame = turn_end_frame + 1
+            if turn_end_frame > start_frame and turn_start_frame < end_frame:
+                injected_info = {
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "segment_kind": segment_kind,
+                    "inject_mode": "START",
+                }
+                injected_turn_frames[turn_end_frame] = dict(injected_info)
+                injected_turn_frames[turn_start_frame] = dict(injected_info)
+                source_root_positions[turn_end_frame] = source_root_positions[start_frame].copy()
+                source_root_positions[turn_start_frame] = source_root_positions[start_frame].copy()
+                internal_segments.append(
+                    InternalPromptSegment(
+                        start_frame=start_frame,
+                        end_frame=turn_end_frame,
+                        num_frames=1,
+                        prompt=_turn_only_prompt(turn_degrees),
+                        segment_kind="TURN",
+                        turn_degrees=turn_degrees,
+                    )
+                )
+                internal_segments.append(
+                    InternalPromptSegment(
+                        start_frame=turn_start_frame,
+                        end_frame=end_frame,
+                        num_frames=1,
+                        prompt=_prompt_without_turn_instruction(prompt, segment_kind),
+                        segment_kind=segment_kind,
+                        path_frames=(turn_start_frame, end_frame),
+                    )
+                )
+                continue
+
+        internal_segments.append(
+            InternalPromptSegment(
+                start_frame=start_frame,
+                end_frame=end_frame,
+                num_frames=1,
+                prompt=prompt,
+                segment_kind=segment_kind,
+                path_frames=(start_frame, end_frame) if segment_kind in {"WALK", "RUN"} else (),
+                turn_degrees=turn_degrees,
+            )
+        )
+
+    internal_segments = _merge_internal_locomotion_segments(internal_segments)
+
+    for index, segment in enumerate(internal_segments):
+        if index < len(internal_segments) - 1:
+            next_segment = internal_segments[index + 1]
+            segment.num_frames = max(next_segment.start_frame - segment.start_frame, 1)
+        else:
+            segment.num_frames = max((segment.end_frame - segment.start_frame) + 1, 1)
+    return internal_segments, injected_turn_frames
 
 
 def build_constraint_request(
@@ -678,31 +1305,26 @@ def build_constraint_request(
     if hips_bone is None:
         raise ValueError("A hips bone assignment is required.")
 
+    visible_prompt_segments = prompt_segments_from_settings(settings, source_frames)
+    expected_segment_count = sum(
+        1 for frame_a, frame_b in zip(source_frames, source_frames[1:]) if int(frame_b) - int(frame_a) >= MIN_HEURISTIC_SEGMENT_FRAMES
+    )
+    if len(visible_prompt_segments) != expected_segment_count:
+        raise ValueError("Process Keyframes first so Beyond Motion can build prompts for the keyframe spans with at least 3 frames between them.")
+    if any(not str(segment.get("prompt", "")).strip() for segment in visible_prompt_segments):
+        raise ValueError("Fill in every visible segment prompt before generating.")
+
     scene = context.scene
     original_frame = scene.frame_current
 
-    source_rotations: dict[int, dict[str, Matrix]] = {}
-    root_control_locations: dict[int, Vector] = {}
-    source_root_positions: dict[int, Vector] = {}
-
-    try:
-        for frame in source_frames:
-            scene.frame_set(frame)
-            context.view_layer.update()
-
-            frame_rotations: dict[str, Matrix] = {}
-            for human_bone_name, blender_bone_name in assignment_map.items():
-                pose_bone = _get_pose_bone(armature_object, blender_bone_name)
-                if pose_bone is None:
-                    continue
-                frame_rotations[human_bone_name] = _matrix_basis_rotation(pose_bone).copy()
-
-            source_rotations[frame] = frame_rotations
-            source_root_positions[frame] = hips_bone.head.copy()
-            root_control_locations[frame] = _capture_root_control_location(armature_object, settings)
-    finally:
-        scene.frame_set(original_frame)
-        context.view_layer.update()
+    source_rotations, root_control_locations, source_root_positions, _hips_heading_degrees, _root_heading_degrees = _capture_source_keyframe_data(
+        context,
+        armature_object,
+        settings,
+        source_frames,
+        assignment_map,
+        hips_bone,
+    )
 
     generation_required = not _sequence_is_static_hold(source_frames, source_rotations, root_control_locations)
     constraint_frames = (
@@ -716,11 +1338,11 @@ def build_constraint_request(
         else source_frames.copy()
     )
     relative_frame_indices = [frame - source_frames[0] for frame in constraint_frames]
-    local_joints_rot: list[list[list[list[float]]]] = []
-    root_positions: list[list[float]] = []
-    smooth_root_2d: list[list[float]] = []
+    source_frame_local_joints_rot: dict[int, list[list[float]]] = {}
+    source_frame_root_positions: dict[int, list[float]] = {}
+    source_frame_root2d: dict[int, list[float]] = {}
     try:
-        for frame in constraint_frames:
+        for frame in source_frames:
             scene.frame_set(frame)
             context.view_layer.update()
             soma_rotations = _build_soma_local_rotations(
@@ -728,32 +1350,98 @@ def build_constraint_request(
                 assignment_map,
                 settings.blender_forward_axis,
             )
-            local_joints_rot.append(
-                [axis_angle_vector_from_matrix(matrix_from_numpy(rotation_matrix)) for rotation_matrix in soma_rotations]
-            )
+            source_frame_local_joints_rot[frame] = [
+                axis_angle_vector_from_matrix(matrix_from_numpy(rotation_matrix)) for rotation_matrix in soma_rotations
+            ]
 
             kimodo_position = blender_position_to_kimodo(hips_bone.head.copy(), settings.blender_forward_axis)
-            root_positions.append(kimodo_position)
-            smooth_root_2d.append([kimodo_position[0], kimodo_position[2]])
+            source_frame_root_positions[frame] = kimodo_position
+            source_frame_root2d[frame] = [kimodo_position[0], kimodo_position[2]]
     finally:
         scene.frame_set(original_frame)
         context.view_layer.update()
 
     request = None
     if generation_required:
+        if not visible_prompt_segments:
+            total_duration_frames = max(source_frames[-1] - source_frames[0], 1)
+            total_duration_seconds = max(total_duration_frames / max(_scene_fps(context), 1.0), 1.0 / max(_scene_fps(context), 1.0))
+            total_displacement = float((source_root_positions[source_frames[-1]] - source_root_positions[source_frames[0]]).length)
+            total_speed = total_displacement / total_duration_seconds
+            total_turn = _average_turn_delta_degrees(_hips_heading_degrees, _root_heading_degrees, source_frames[0], source_frames[-1])
+            if total_displacement < 0.06 or total_speed < WEIGHT_SHIFT_SPEED_MPS:
+                segment_kind = "SHIFT"
+            elif total_speed <= WALKING_SPEED_MAX_MPS:
+                segment_kind = "WALK"
+            else:
+                segment_kind = "RUN"
+            visible_prompt_segments = [{
+                "start_frame": int(source_frames[0]),
+                "end_frame": int(source_frames[-1]),
+                "duration_frames": int(total_duration_frames),
+                "segment_kind": segment_kind,
+                "prompt": _prompt_for_segment(segment_kind, total_turn),
+                "turn_degrees": float(total_turn),
+            }]
+        internal_prompt_segments, injected_turn_frames = _build_internal_prompt_plan(
+            context,
+            visible_prompt_segments,
+            source_root_positions,
+            _hips_heading_degrees,
+            _root_heading_degrees,
+        )
+        internal_constraint_frames = sorted(set(constraint_frames) | set(injected_turn_frames.keys()))
+        internal_relative_frame_indices = [frame - source_frames[0] for frame in internal_constraint_frames]
+        local_joints_rot: list[list[list[float]]] = []
+        root_positions: list[list[float]] = []
+        smooth_root_2d: list[list[float]] = []
+        hips_index = SOMA77_INDEX["Hips"]
+        for frame in internal_constraint_frames:
+            if frame in injected_turn_frames:
+                start_frame = int(injected_turn_frames[frame]["start_frame"])
+                end_frame = int(injected_turn_frames[frame]["end_frame"])
+                inject_mode = str(injected_turn_frames[frame].get("inject_mode", "START"))
+                if inject_mode == "END":
+                    injected_rotations = [rotation.copy() for rotation in source_frame_local_joints_rot[end_frame]]
+                    injected_rotations[hips_index] = source_frame_local_joints_rot[start_frame][hips_index].copy()
+                    root_positions.append(source_frame_root_positions[end_frame])
+                    smooth_root_2d.append(source_frame_root2d[end_frame])
+                else:
+                    injected_rotations = [rotation.copy() for rotation in source_frame_local_joints_rot[start_frame]]
+                    injected_rotations[hips_index] = source_frame_local_joints_rot[end_frame][hips_index].copy()
+                    root_positions.append(source_frame_root_positions[start_frame])
+                    smooth_root_2d.append(source_frame_root2d[start_frame])
+                local_joints_rot.append(injected_rotations)
+            else:
+                local_joints_rot.append(source_frame_local_joints_rot[frame])
+                root_positions.append(source_frame_root_positions[frame])
+                smooth_root_2d.append(source_frame_root2d[frame])
+
         constraints = [
             {
                 "type": "fullbody",
-                "frame_indices": relative_frame_indices,
+                "frame_indices": internal_relative_frame_indices,
                 "local_joints_rot": local_joints_rot,
                 "root_positions": root_positions,
                 "smooth_root_2d": smooth_root_2d,
             }
         ]
+        if bool(getattr(settings, "use_locomotion_root_path", True)):
+            root2d_constraint = _build_root2d_constraint(
+                source_frames[0],
+                source_root_positions,
+                internal_prompt_segments,
+                settings.blender_forward_axis,
+            )
+            if root2d_constraint is not None:
+                constraints.append(root2d_constraint)
+
+        prompts = [segment.prompt for segment in internal_prompt_segments]
+        num_frames = [max(int(segment.num_frames), 1) for segment in internal_prompt_segments]
         request = {
-            "prompt": settings.prompt.strip(),
+            "prompt": prompts if len(prompts) > 1 else prompts[0],
             "model_name": settings.model_name,
-            "num_frames": int(source_frames[-1] - source_frames[0] + 1),
+            "num_frames": num_frames if len(num_frames) > 1 else num_frames[0],
             "diffusion_steps": int(settings.diffusion_steps),
             "constraints": constraints,
             "cfg_type": settings.cfg_type,
@@ -761,6 +1449,8 @@ def build_constraint_request(
             "cfg_constraint_weight": float(settings.cfg_constraint_weight),
             "seed": None if settings.seed < 0 else int(settings.seed),
             "post_processing": bool(settings.apply_postprocess),
+            "multi_prompt": len(prompts) > 1,
+            "num_transition_frames": 4,
         }
     captured = CapturedSourceData(
         source_frames=source_frames,
@@ -777,6 +1467,7 @@ def build_constraint_request(
             source_rotations,
             root_control_locations,
         ),
+        injected_turn_frames=tuple(sorted(injected_turn_frames.keys())) if generation_required else (),
     )
     return request, captured
 
@@ -974,19 +1665,82 @@ def _keypose_match_factor(scene_frame: int, source_frame: int, window: int) -> f
     return (window + 1 - frame_delta) / float(window + 1)
 
 
+def _keypose_match_quarter_window(span: int) -> int:
+    return max(1, int(np.ceil(max(span, 1) * 0.25)))
+
+
+def _keypose_match_source_influences(
+    scene_frame: int,
+    source_frames: list[int],
+    break_frames: tuple[int, ...] = (),
+) -> list[tuple[int, float]]:
+    if not source_frames:
+        return []
+    ordered_frames = sorted(int(frame) for frame in source_frames)
+    ordered_breaks = sorted(int(frame) for frame in break_frames)
+    if scene_frame in ordered_frames:
+        return [(int(scene_frame), 1.0)]
+    if scene_frame <= ordered_frames[0]:
+        return [(ordered_frames[0], 1.0)]
+    if scene_frame >= ordered_frames[-1]:
+        return [(ordered_frames[-1], 1.0)]
+
+    for previous_frame, next_frame in zip(ordered_frames, ordered_frames[1:]):
+        if previous_frame < scene_frame < next_frame:
+            segment_breaks = [
+                frame
+                for frame in ordered_breaks
+                if previous_frame < frame < next_frame
+            ]
+            span = max(next_frame - previous_frame, 1)
+            quarter_window = _keypose_match_quarter_window(span)
+            start_blend_end = min(previous_frame + quarter_window, next_frame - 1)
+            end_blend_start = max(next_frame - quarter_window, previous_frame + 1)
+
+            if segment_breaks:
+                first_break = segment_breaks[0]
+                last_break = segment_breaks[-1]
+                start_blend_end = min(start_blend_end, first_break - 1)
+                end_blend_start = max(end_blend_start, last_break + 1)
+                if first_break <= scene_frame <= last_break:
+                    return []
+
+            if previous_frame < scene_frame <= start_blend_end:
+                denominator = max(start_blend_end - previous_frame, 1)
+                factor = 1.0 - ((scene_frame - previous_frame) / float(denominator))
+                return [(previous_frame, max(0.0, factor))]
+
+            if end_blend_start <= scene_frame < next_frame:
+                denominator = max(next_frame - end_blend_start, 1)
+                factor = (scene_frame - end_blend_start) / float(denominator)
+                return [(next_frame, max(0.0, factor))]
+
+            return []
+    return []
+
+
+def _keypose_match_affected_frames(
+    source_frames: list[int],
+    break_frames: tuple[int, ...] = (),
+) -> list[int]:
+    if not source_frames:
+        return []
+    frame_start = int(min(source_frames))
+    frame_end = int(max(source_frames))
+    affected_frames: list[int] = []
+    for scene_frame in range(frame_start, frame_end + 1):
+        if _keypose_match_source_influences(scene_frame, source_frames, break_frames):
+            affected_frames.append(scene_frame)
+    return affected_frames
+
+
 def _keypose_match_step_count(source_data: CapturedSourceData, window: int) -> int:
     if window <= 0 or not source_data.constraint_frames:
         return 0
-    frame_start = source_data.source_frames[0]
-    frame_end = source_data.source_frames[-1]
-    affected_frames = {
-        frame
-        for source_frame in source_data.constraint_frames
-        for frame in range(
-            max(frame_start, source_frame - window),
-            min(frame_end, source_frame + window) + 1,
-        )
-    }
+    affected_frames = _keypose_match_affected_frames(
+        source_data.constraint_frames,
+        source_data.injected_turn_frames,
+    )
     return (len(affected_frames) * 2) + len(source_data.constraint_frames)
 
 
@@ -1001,18 +1755,9 @@ def _iter_keypose_match_pass(
     if window <= 0 or not source_data.constraint_frames:
         return
 
-    frame_start = source_data.source_frames[0]
-    frame_end = source_data.source_frames[-1]
-    source_frame_set = set(source_data.constraint_frames)
-    affected_frames = sorted(
-        {
-            frame
-            for source_frame in source_data.constraint_frames
-            for frame in range(
-                max(frame_start, source_frame - window),
-                min(frame_end, source_frame + window) + 1,
-            )
-        }
+    affected_frames = _keypose_match_affected_frames(
+        source_data.constraint_frames,
+        source_data.injected_turn_frames,
     )
     if not affected_frames:
         return
@@ -1073,20 +1818,19 @@ def _iter_keypose_match_pass(
             corrected_rotations = {name: matrix.copy() for name, matrix in base_rotations.items()}
             corrected_root = base_roots_by_frame.get(scene_frame, Vector((0.0, 0.0, 0.0))).copy()
 
-            if scene_frame in source_frame_set:
-                active_source_frames = [(scene_frame, 1.0)]
-            else:
-                active_source_frames = [
-                    (source_frame, _keypose_match_factor(scene_frame, source_frame, window))
-                    for source_frame in source_data.constraint_frames
-                ]
-                active_source_frames = [
-                    (source_frame, factor)
-                    for source_frame, factor in active_source_frames
-                    if factor > 0.0
-                ]
+            active_source_frames = _keypose_match_source_influences(
+                scene_frame,
+                source_data.constraint_frames,
+                source_data.injected_turn_frames,
+            )
 
             if not active_source_frames:
+                completed_steps += 1
+                yield {
+                    "progress": completed_steps / float(total_steps),
+                    "status_text": "Applying keypose matching...",
+                    "detail_text": f"Preserving injected turn motion at frame {scene_frame}.",
+                }
                 continue
 
             for source_frame, factor in active_source_frames:
@@ -1162,6 +1906,7 @@ def iter_apply_generated_motion(
     sample_cache: dict[int, tuple[dict[str, Matrix], Vector, Vector, dict[str, Matrix]]] = {}
     keypose_window = int(getattr(settings, "keypose_match_frames", 0) or 0)
     keypose_steps = _keypose_match_step_count(source_data, keypose_window)
+    use_adjacent_override_pass = keypose_window <= 0
 
     def cached_generated_motion_sample(relative_index: int) -> tuple[dict[str, Matrix], Vector, Vector, dict[str, Matrix]]:
         cached = sample_cache.get(relative_index)
@@ -1197,23 +1942,25 @@ def iter_apply_generated_motion(
             target_pose_global_rotations,
         )
 
-    for constraint_frame in source_data.constraint_frames:
-        override_frame = _preferred_generated_override_frame(
-            source_data.constraint_frames,
-            constraint_frame,
-            frame_start,
-            local_rot_mats.shape[0],
-        )
-        if override_frame is None:
-            continue
-        overridden_constraint_frames[constraint_frame] = override_frame - frame_start
-        if abs(override_frame - constraint_frame) == 1:
-            override_source_frames_to_delete.add(override_frame)
+    if use_adjacent_override_pass:
+        for constraint_frame in source_data.constraint_frames:
+            override_frame = _preferred_generated_override_frame(
+                source_data.constraint_frames,
+                constraint_frame,
+                frame_start,
+                local_rot_mats.shape[0],
+            )
+            if override_frame is None:
+                continue
+            overridden_constraint_frames[constraint_frame] = override_frame - frame_start
+            if abs(override_frame - constraint_frame) == 1:
+                override_source_frames_to_delete.add(override_frame)
 
     total_steps = local_rot_mats.shape[0]
-    if source_data.source_loop_matches:
+    if source_data.source_loop_matches and use_adjacent_override_pass:
         total_steps += 1
-    total_steps += len(override_source_frames_to_delete)
+    if use_adjacent_override_pass:
+        total_steps += len(override_source_frames_to_delete)
     total_steps += keypose_steps
     total_steps = max(total_steps, 1)
     completed_steps = 0
@@ -1240,36 +1987,37 @@ def iter_apply_generated_motion(
                 rotations, root_location, generated_root, target_pose_global_rotations = cached_generated_motion_sample(
                     relative_index,
                 )
-                for overridden_keyframe, overridden_relative_index in overridden_constraint_frames.items():
-                    smoothing_factor = _override_smoothing_factor(scene_frame, overridden_keyframe, window=2)
-                    if smoothing_factor <= 0.0:
-                        continue
-                    (
-                        overridden_rotations,
-                        overridden_root_location,
-                        overridden_generated_root,
-                        overridden_target_pose_global_rotations,
-                    ) = cached_generated_motion_sample(overridden_relative_index)
-                    for human_bone_name, rotation_matrix in list(rotations.items()):
-                        overridden_rotation = overridden_rotations.get(human_bone_name)
-                        if overridden_rotation is None:
+                if use_adjacent_override_pass:
+                    for overridden_keyframe, overridden_relative_index in overridden_constraint_frames.items():
+                        smoothing_factor = _override_smoothing_factor(scene_frame, overridden_keyframe, window=2)
+                        if smoothing_factor <= 0.0:
                             continue
-                        rotations[human_bone_name] = _blend_rotation_matrices(
-                            rotation_matrix,
-                            overridden_rotation,
-                            smoothing_factor,
-                        )
-                    for bone_name, target_matrix in list(target_pose_global_rotations.items()):
-                        overridden_target = overridden_target_pose_global_rotations.get(bone_name)
-                        if overridden_target is None:
-                            continue
-                        target_pose_global_rotations[bone_name] = _blend_rotation_matrices(
-                            target_matrix,
-                            overridden_target,
-                            smoothing_factor,
-                        )
-                    root_location = _blend_vectors(root_location, overridden_root_location, smoothing_factor)
-                    generated_root = _blend_vectors(generated_root, overridden_generated_root, smoothing_factor)
+                        (
+                            overridden_rotations,
+                            overridden_root_location,
+                            overridden_generated_root,
+                            overridden_target_pose_global_rotations,
+                        ) = cached_generated_motion_sample(overridden_relative_index)
+                        for human_bone_name, rotation_matrix in list(rotations.items()):
+                            overridden_rotation = overridden_rotations.get(human_bone_name)
+                            if overridden_rotation is None:
+                                continue
+                            rotations[human_bone_name] = _blend_rotation_matrices(
+                                rotation_matrix,
+                                overridden_rotation,
+                                smoothing_factor,
+                            )
+                        for bone_name, target_matrix in list(target_pose_global_rotations.items()):
+                            overridden_target = overridden_target_pose_global_rotations.get(bone_name)
+                            if overridden_target is None:
+                                continue
+                            target_pose_global_rotations[bone_name] = _blend_rotation_matrices(
+                                target_matrix,
+                                overridden_target,
+                                smoothing_factor,
+                            )
+                        root_location = _blend_vectors(root_location, overridden_root_location, smoothing_factor)
+                        generated_root = _blend_vectors(generated_root, overridden_generated_root, smoothing_factor)
             _apply_sampled_frame(
                 armature_object,
                 settings,
@@ -1287,7 +2035,7 @@ def iter_apply_generated_motion(
                 "detail_text": f"Writing generated keys at frame {scene_frame}.",
             }
 
-        if source_data.source_loop_matches:
+        if source_data.source_loop_matches and use_adjacent_override_pass:
             first_frame = source_data.source_frames[0]
             last_frame = source_data.source_frames[-1]
             first_override_relative_index = overridden_constraint_frames.get(first_frame)
@@ -1321,14 +2069,15 @@ def iter_apply_generated_motion(
                     "detail_text": f"Preserving loop continuity at frame {last_frame}.",
                 }
 
-        for frame in sorted(override_source_frames_to_delete):
-            _delete_generated_frame_keys(armature_object, settings, assignment_map, frame)
-            completed_steps += 1
-            yield {
-                "progress": completed_steps / float(total_steps),
-                "status_text": "Cleaning adjacent override keys...",
-                "detail_text": f"Removing temporary override keys at frame {frame}.",
-            }
+        if use_adjacent_override_pass:
+            for frame in sorted(override_source_frames_to_delete):
+                _delete_generated_frame_keys(armature_object, settings, assignment_map, frame)
+                completed_steps += 1
+                yield {
+                    "progress": completed_steps / float(total_steps),
+                    "status_text": "Cleaning adjacent override keys...",
+                    "detail_text": f"Removing temporary override keys at frame {frame}.",
+                }
 
         if keypose_window > 0:
             keypose_base_step = completed_steps

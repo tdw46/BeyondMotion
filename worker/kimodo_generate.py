@@ -64,11 +64,21 @@ def main() -> int:
             float(request.get("cfg_constraint_weight", 2.0)),
         ]
 
+    prompts = request["prompt"]
+    num_frames = request["num_frames"]
+    multi_prompt = bool(request.get("multi_prompt", False))
+    if isinstance(prompts, list):
+        multi_prompt = multi_prompt or len(prompts) > 1
+    if isinstance(num_frames, list):
+        multi_prompt = multi_prompt or len(num_frames) > 1
+
     output = model(
-        request["prompt"],
-        int(request["num_frames"]),
+        prompts,
+        num_frames,
         num_denoising_steps=int(request["diffusion_steps"]),
+        multi_prompt=multi_prompt,
         constraint_lst=constraint_lst,
+        num_transition_frames=int(request.get("num_transition_frames", 5)),
         post_processing=bool(request.get("post_processing", False)),
         **cfg_kwargs,
     )
@@ -97,6 +107,7 @@ def main() -> int:
                 "device": device,
                 "requested_device": requested_device,
                 "fps": float(model.fps),
+                "num_frames": int(as_numpy(output["root_positions"]).shape[0]),
             },
             indent=2,
         ),
