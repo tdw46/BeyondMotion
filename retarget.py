@@ -241,6 +241,7 @@ CANONICAL_TO_SOMA = {
 class CapturedSourceData:
     source_frames: list[int]
     constraint_frames: list[int]
+    keypose_frames: list[int]
     relative_frame_indices: list[int]
     source_rotations: dict[int, dict[str, Matrix]]
     root_control_locations: dict[int, Any]
@@ -1515,6 +1516,31 @@ def build_constraint_request(
                 root_positions.append(source_frame_root_positions[frame])
                 smooth_root_2d.append(source_frame_root2d[frame])
 
+        for frame, injected_info in injected_turn_frames.items():
+            start_frame = int(injected_info["start_frame"])
+            end_frame = int(injected_info["end_frame"])
+            inject_mode = str(injected_info.get("inject_mode", "START"))
+            if inject_mode == "END":
+                injected_frame_rotations = {
+                    human_bone_name: matrix.copy()
+                    for human_bone_name, matrix in source_rotations[end_frame].items()
+                }
+                hips_rotation = source_rotations.get(start_frame, {}).get("hips")
+                if hips_rotation is not None:
+                    injected_frame_rotations["hips"] = hips_rotation.copy()
+                source_rotations[frame] = injected_frame_rotations
+                root_control_locations[frame] = root_control_locations[end_frame].copy()
+            else:
+                injected_frame_rotations = {
+                    human_bone_name: matrix.copy()
+                    for human_bone_name, matrix in source_rotations[start_frame].items()
+                }
+                hips_rotation = source_rotations.get(end_frame, {}).get("hips")
+                if hips_rotation is not None:
+                    injected_frame_rotations["hips"] = hips_rotation.copy()
+                source_rotations[frame] = injected_frame_rotations
+                root_control_locations[frame] = root_control_locations[start_frame].copy()
+
         constraints = [
             {
                 "type": "fullbody",
@@ -1553,6 +1579,7 @@ def build_constraint_request(
     captured = CapturedSourceData(
         source_frames=source_frames,
         constraint_frames=constraint_frames,
+        keypose_frames=internal_constraint_frames if generation_required else constraint_frames.copy(),
         relative_frame_indices=relative_frame_indices,
         source_rotations=source_rotations,
         root_control_locations=root_control_locations,
@@ -1838,13 +1865,12 @@ def _keypose_match_affected_frames(
 
 
 def _keypose_match_step_count(source_data: CapturedSourceData, window: int) -> int:
-    if window <= 0 or not source_data.constraint_frames:
+    if window <= 0 or not source_data.keypose_frames:
         return 0
     affected_frames = _keypose_match_affected_frames(
-        source_data.constraint_frames,
-        source_data.injected_turn_frames,
+        source_data.keypose_frames,
     )
-    return (len(affected_frames) * 2) + len(source_data.constraint_frames)
+    return (len(affected_frames) * 2) + len(source_data.keypose_frames)
 
 
 def _iter_keypose_match_pass(
@@ -1855,12 +1881,11 @@ def _iter_keypose_match_pass(
     assignment_map: dict[str, str],
     window: int,
 ) -> Iterator[dict[str, Any]]:
-    if window <= 0 or not source_data.constraint_frames:
+    if window <= 0 or not source_data.keypose_frames:
         return
 
     affected_frames = _keypose_match_affected_frames(
-        source_data.constraint_frames,
-        source_data.injected_turn_frames,
+        source_data.keypose_frames,
     )
     if not affected_frames:
         return
@@ -1899,7 +1924,7 @@ def _iter_keypose_match_pass(
                 "detail_text": f"Capturing base motion at frame {scene_frame}.",
             }
 
-        for source_frame in source_data.constraint_frames:
+        for source_frame in source_data.keypose_frames:
             base_rotation_channels = base_rotation_channels_by_frame.get(source_frame)
             base_root = base_roots_by_frame.get(source_frame)
             if base_rotation_channels is None or base_root is None:
@@ -1947,8 +1972,7 @@ def _iter_keypose_match_pass(
 
             active_source_frames = _keypose_match_source_influences(
                 scene_frame,
-                source_data.constraint_frames,
-                source_data.injected_turn_frames,
+                source_data.keypose_frames,
             )
 
             if not active_source_frames:
